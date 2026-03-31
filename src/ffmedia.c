@@ -33,18 +33,18 @@ const int CHANNELS = 2;
 const int BPC = 2; // Bytes per channel.
 const int BPS = 4; // Bytes per sample.
 
-const int FRAMES = 3;
+#define FRAMES 3
 
 // The alignment of each row of pixels.
-const int ROW_ALIGNMENT = 16;
+#define ROW_ALIGNMENT 16
 
 // The number of pixels on each side. This has to be greater that 0 (since
 // Ren'Py needs some padding), FRAME_PADDING * BPS has to be a multiple of
 // 16 (alignment issues on ARM NEON), and has to match the crop in the
 // read_video function of renpysound.pyx.
-const int FRAME_PADDING = ROW_ALIGNMENT / 4;
+#define FRAME_PADDING (ROW_ALIGNMENT / 4)
 
-const int SPEED = 1;
+#define SPEED 1
 
 // How many seconds early can frames be delivered?
 static const double frame_early_delivery = .005;

@@ -422,9 +422,9 @@ static void callback(void *userdata, Uint8 *stream, int length) {
     // Convert the length to samples.
     length /= (2 * sizeof(float));
 
-    float mix_buffer[length * 2];
-    short stream_buffer[length * 2];
-    float float_buffer[length * 2];
+    float *mix_buffer = (float *)_alloca(length * 2 * sizeof(float));
+    short *stream_buffer = (short *)_alloca(length * 2 * sizeof(short));
+    float *float_buffer = (float *)_alloca(length * 2 * sizeof(float));
 
     memset(mix_buffer, 0, length * 2 * sizeof(float));
 
