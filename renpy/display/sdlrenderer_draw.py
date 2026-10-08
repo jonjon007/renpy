@@ -69,48 +69,63 @@ def _clear_target(renderer, w, h):
 
 
 class TextureCache:
-    """Manages GPU texture lifecycle with LRU eviction."""
+    """
+    GPU textures for pygame Surfaces, reused across frames.
 
-    def __init__(self, renderer):
+    Each entry keeps its surface alive, so id(surface) can't be recycled by
+    a different surface while cached. Textures are destroyed only in
+    end_frame(): on D3D12 every SDL_DestroyTexture flushes and waits for the
+    GPU, which is cheap right after present (already idle) but very slow
+    mid-frame.
+    """
+
+    def __init__(self, renderer, max_age=120, max_bytes=256 * 1024 * 1024):
         self.renderer = renderer
-        self.cache = {}           # id(surface) -> (GPUTexture, generation)
-        self.access_order = []    # LRU list of id(surface)
-        self.generations = {}     # id(surface) -> generation counter
+        self.entries = collections.OrderedDict()  # id(surf) -> [surf, tex, nbytes, last_frame], LRU first
+        self.stale = set()        # ids mutated since upload (may be added off the main thread)
+        self.retired = []         # textures to destroy in end_frame()
         self.upload_queue = []    # surfaces waiting for lazy upload
-        self.max_textures = 1024
+        self.bytes = 0
+        self.max_age = max_age
+        self.max_bytes = max_bytes
+        self.frame = 0
 
     def get(self, surf):
         """Get cached GPU texture for a pygame Surface, or None."""
         sid = id(surf)
-        entry = self.cache.get(sid)
-        if entry is not None:
-            tex, gen = entry
-            if gen == self.generations.get(sid, 0) and tex.valid:
-                self._touch(sid)
-                return tex
-            # Stale — destroy and re-upload
-            tex.destroy()
-            self.cache.pop(sid, None)
-        return None
+        entry = self.entries.get(sid)
+        if entry is None:
+            return None
+        if sid in self.stale or not entry[1].valid:
+            self.stale.discard(sid)
+            self._retire(sid)
+            return None
+        entry[3] = self.frame
+        self.entries.move_to_end(sid)
+        return entry[1]
+
+    def get_or_upload(self, surf):
+        tex = self.get(surf)
+        if tex is None:
+            tex = self.upload(surf)
+        return tex
 
     _upload_log_count = 0
 
-    def upload(self, surf, transient=False):
+    def upload(self, surf):
         """Upload a surface to GPU texture immediately. Returns GPUTexture."""
         sid = id(surf)
 
-        # Guard against zero-size surfaces (D3D12 rejects height/width of 0)
+        # D3D12 rejects zero-size textures
         try:
             sw, sh = surf.get_size()
-            if sw <= 0 or sh <= 0:
-                _dbg("upload: skipping zero-size surface %dx%d" % (sw, sh))
-                return None
         except Exception:
-            pass
+            return None
+        if sw <= 0 or sh <= 0:
+            return None
 
-        old = self.cache.get(sid)
-        if old is not None:
-            old[0].destroy()
+        self.stale.discard(sid)
+        self._retire(sid)
 
         # Xbox D3D12 workaround: surfaces from SDL_ConvertSurface have
         # internal state that corrupts alpha during texture upload. Copy
@@ -136,12 +151,9 @@ class TextureCache:
             return None
 
         tex.set_blend_mode(BLENDMODE_BLEND)
-        gen = self.generations.get(sid, 0)
-        self.cache[sid] = (tex, gen)
-        self._touch(sid)
-
-        if not transient:
-            self._maybe_evict()
+        nbytes = sw * sh * 4
+        self.entries[sid] = [surf, tex, nbytes, self.frame]
+        self.bytes += nbytes
 
         return tex
 
@@ -154,45 +166,55 @@ class TextureCache:
         if not self.upload_queue:
             return False
         surf = self.upload_queue.pop(0)
-        if self.get(surf) is None:
-            self.upload(surf)
+        self.get_or_upload(surf)
         return True
 
     def invalidate(self, surf):
         """Mark a surface as mutated — its cached texture is stale."""
         sid = id(surf)
-        self.generations[sid] = self.generations.get(sid, 0) + 1
+        if sid in self.entries:
+            self.stale.add(sid)
 
-        # Off the main thread, the generation bump is enough: get() destroys
-        # the stale texture on the main thread.
-        if not _on_main_thread():
-            return
-
-        entry = self.cache.pop(sid, None)
+    def _retire(self, sid):
+        entry = self.entries.pop(sid, None)
         if entry is not None:
-            entry[0].destroy()
+            self.bytes -= entry[2]
+            self.retired.append(entry[1])
+
+    def end_frame(self):
+        """Evict old/stale textures and destroy retired ones. Call after present."""
+        for sid in list(self.stale):
+            self.stale.discard(sid)
+            self._retire(sid)
+
+        oldest = self.frame - self.max_age
+        while self.entries:
+            sid, entry = next(iter(self.entries.items()))
+            if entry[3] >= self.frame:
+                break
+            if entry[3] > oldest and self.bytes <= self.max_bytes:
+                break
+            self._retire(sid)
+
+        self._destroy_retired()
+        self.frame += 1
+
+    def _destroy_retired(self):
+        retired, self.retired = self.retired, []
+        for tex in retired:
+            try:
+                tex.destroy()
+            except Exception:
+                pass
 
     def clear(self):
         """Destroy all cached textures."""
-        for tex, gen in self.cache.values():
-            tex.destroy()
-        self.cache.clear()
-        self.access_order.clear()
+        for sid in list(self.entries):
+            self._retire(sid)
+        self._destroy_retired()
         self.upload_queue.clear()
-        self.generations.clear()
-
-    def _touch(self, sid):
-        if sid in self.access_order:
-            self.access_order.remove(sid)
-        self.access_order.append(sid)
-
-    def _maybe_evict(self):
-        while len(self.cache) > self.max_textures and self.access_order:
-            sid = self.access_order.pop(0)
-            entry = self.cache.get(sid)
-            if entry is not None:
-                entry[0].destroy()
-                del self.cache[sid]
+        self.stale.clear()
+        self.bytes = 0
 
 
 class SDLRendererDraw:
@@ -232,10 +254,6 @@ class SDLRendererDraw:
         # Debug frame counter — log verbose for first N frames
         self._frame_count = 0
         self._dbg_frames = 5
-        self._frame_textures = {}
-        # Deferred texture destruction — keep textures alive for 3 frames
-        # to ensure GPU has finished with them (D3D12 triple-buffered)
-        self._destroy_ring = [[] for _ in range(4)]
 
     def init(self, virtual_size):
         """Initialize the SDL_Renderer backend."""
@@ -423,13 +441,7 @@ class SDLRendererDraw:
         if not _on_main_thread():
             return surf
 
-        tex = self.texture_cache.get(surf)
-        if tex is None:
-            tex = self.texture_cache.upload(surf, transient=transient)
-            if tex is None:
-                # Upload failed (e.g. zero-size) — still return surf for Ren'Py's cache
-                return surf
-
+        self.texture_cache.get_or_upload(surf)
         return surf
 
     def ready_one_texture(self):
@@ -488,18 +500,6 @@ class SDLRendererDraw:
             _dbg("draw_screen: frame %d" % self._frame_count)
             self._dump_tree(surftree, 0, 3)
 
-        # Per-frame texture cache — avoids cross-frame D3D12 staging issues
-        self._frame_textures = {}
-
-        # Destroy textures from 4 frames ago (GPU guaranteed to be done)
-        slot = self._frame_count % 4
-        for tex in self._destroy_ring[slot]:
-            try:
-                tex.destroy()
-            except Exception:
-                pass
-        self._destroy_ring[slot] = []
-
         try:
             # Clear screen
             self.renderer.clear((0, 0, 0, 255))
@@ -518,38 +518,20 @@ class SDLRendererDraw:
             import traceback
             _dbg(traceback.format_exc())
         finally:
-            # Queue this frame's textures for deferred destruction
-            self._destroy_ring[slot] = list(self._frame_textures.values())
-            self._frame_textures = {}
+            if self.texture_cache is not None:
+                self.texture_cache.end_frame()
 
     def _get_texture(self, surf):
-        """Get the GPUTexture for a pygame Surface, uploading if needed.
+        """Get the GPUTexture for a pygame Surface, uploading it on first use.
 
-        Uses a per-frame cache to avoid redundant uploads within a frame.
-        Textures are destroyed at end of frame to avoid cross-frame issues
-        with D3D12 staging buffer synchronization on Xbox.
+        Textures persist across frames, so animations only re-issue draw
+        calls instead of re-copying and re-uploading every surface.
         """
         if self.texture_cache is None:
             return None
 
-        sid = id(surf)
-
-        # Check per-frame cache first
-        entry = self._frame_textures.get(sid)
-        if entry is not None:
-            return entry
-
-        # Create fresh texture from clean surface copy
         try:
-            sw, sh = surf.get_size()
-            if sw <= 0 or sh <= 0:
-                return None
-            clean = pygame.Surface((sw, sh), pygame.SRCALPHA, 32)
-            renpy.display.accelerator.nogil_copy(surf, clean)
-            tex = self.renderer.create_texture_from_surface(clean)
-            tex.set_blend_mode(BLENDMODE_BLEND)
-            self._frame_textures[sid] = tex
-            return tex
+            return self.texture_cache.get_or_upload(surf)
         except Exception:
             return None
 
@@ -1323,6 +1305,5 @@ class SDLRendererDraw:
     def get_texture_size(self):
         """Return total texture memory and count."""
         if self.texture_cache:
-            count = len(self.texture_cache.cache)
-            return (0, count)  # We don't track exact GPU memory
+            return (self.texture_cache.bytes, len(self.texture_cache.entries))
         return (0, 0)
