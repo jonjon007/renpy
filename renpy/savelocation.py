@@ -697,8 +697,10 @@ def init():
     # 1. User savedir.
     location_add(renpy.config.savedir)
 
-    # 2. Game-local savedir.
-    if (not renpy.mobile) and (not renpy.macapp):
+    # 2. Game-local savedir. Skipped on Xbox: the install dir is read-only
+    # in packages, and loose deploys allow writes but fail renames.
+    xbox = os.environ.get("RENPY_PLATFORM", "").startswith("xbox")
+    if (not renpy.mobile) and (not renpy.macapp) and (not xbox):
         path = os.path.join(renpy.config.gamedir, "saves")
         location_add(path)
 
