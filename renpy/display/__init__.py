@@ -23,6 +23,7 @@ import renpy
 
 import renpy.log
 
+
 # The draw object through which all drawing is routed. This object
 # contains all of the distinction between the software and GL
 # renderers.

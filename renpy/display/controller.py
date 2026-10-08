@@ -69,9 +69,11 @@ def init():
     except Exception:
         renpy.display.log.exception()
 
+    count = pygame.controller.get_count()
+
     if not renpy.display.interface.safe_mode:
         try:
-            for i in range(pygame.controller.get_count()):
+            for i in range(count):
                 start(i)
         except Exception:
             renpy.display.log.exception()
@@ -154,11 +156,14 @@ def start(index):
     if not c.is_controller():
         return
 
-    renpy.exports.write_log("controller: %r %r %r" % (c.get_guid_string(), c.get_name(), c.is_controller()))
+    guid = c.get_guid_string()
+    name = c.get_name()
+
+    renpy.exports.write_log("controller: %r %r %r" % (guid, name, c.is_controller()))
 
     if renpy.game.preferences.pad_enabled != "all":
         for prefix in renpy.config.controller_blocklist:
-            if c.get_guid_string().startswith(prefix):
+            if guid.startswith(prefix):
                 renpy.exports.write_log("Controller found in blocklist, not using.")
                 return
 
@@ -225,6 +230,7 @@ def controller_event(control, state):
 
 
 def periodic():
+
     for pe in pad_events.values():
         pe.repeat()
 

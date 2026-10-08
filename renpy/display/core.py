@@ -241,6 +241,12 @@ def get_safe_mode() -> bool:
     if getattr(renpy.game.args, "safe_mode", False):
         return True
 
+    # Xbox GDK has no keyboard — safe mode is meaningless and GetKeyState
+    # may return garbage through the limited user32.dll shim.
+    import os
+    if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+        return False
+
     try:
         if renpy.windows:
             import ctypes
@@ -972,8 +978,15 @@ class Interface:
         if renpy.android and not renpy.config.log_to_stdout:
             print(s)
 
-        # Clear out any pending events.
-        pygame.event.get()
+        # Clear out any pending events, but preserve controller device events
+        # so CONTROLLERDEVICEADDED isn't lost (critical on Xbox GDK where
+        # GameInput enumeration may be async).
+        for _ev in pygame.event.get():
+            if _ev.type == pygame.CONTROLLERDEVICEADDED:
+                renpy.display.controller.event(_ev)
+
+        import sys as _sys2
+        _sys2.stdout.write("XBOX_DEBUG: start() COMPLETE\n"); _sys2.stdout.flush()
 
         for i in renpy.config.display_start_callbacks:
             i()
@@ -1111,14 +1124,19 @@ class Interface:
         else:
             renderers = ["gl2", "gles2"]
 
+        # Xbox: prefer sdlrenderer (GPU via SDL_Renderer/D3D12), fall back to sw
+        if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+            renderers = ["sdlrenderer", "sw"]
+
+        # Software renderer is the last hope for PC .
+        if not (renpy.android or renpy.ios or renpy.emscripten):
+            if "sw" not in renderers:
+                renderers = renderers + ["sw"]
+
         # Prevent a performance warning if the renderer
         # is taken from old persistent data.
         if renderer not in renderers:
             renderer = "auto"
-
-        # Software renderer is the last hope for PC .
-        if not (renpy.android or renpy.ios or renpy.emscripten):
-            renderers = renderers + ["sw"]
 
         if renderer in renderers:
             renderers = [renderer, "sw"]
@@ -1151,6 +1169,8 @@ class Interface:
         make_draw("gl2", "renpy.gl2.gl2draw", "GL2Draw", "gl2")
         make_draw("angle2", "renpy.gl2.gl2draw", "GL2Draw", "angle2")
         make_draw("gles2", "renpy.gl2.gl2draw", "GL2Draw", "gles2")
+
+        make_draw("sdlrenderer", "renpy.display.sdlrenderer_draw", "SDLRendererDraw")
 
         make_draw("sw", "renpy.display.swdraw", "SWDraw")
 
@@ -1252,10 +1272,12 @@ class Interface:
             renpy.display.log.write("")
             renpy.display.log.write("Initializing {0} renderer:".format(name))
             if draw.init(virtual_size):
+                renpy.display.log.write("Selected renderer: {0}".format(name))
                 renpy.display.draw = draw
                 renpy.display.render.models = draw.info.get("models", False)
                 break
             else:
+                renpy.display.log.write("Renderer {0} failed to initialize.".format(name))
                 pygame.display.destroy()
 
         else:

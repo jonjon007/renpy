@@ -1315,6 +1315,12 @@ int transform32_std(PyObject *pysrc, PyObject *pydst,
             int px = sxi >> 16;
             int py = syi >> 16;
 
+            // Clamp to prevent bilinear 2x2 read from going out of bounds.
+            if (px < 0) px = 0;
+            if (py < 0) py = 0;
+            if (px >= srcw - 1) px = srcw - 2;
+            if (py >= srch - 1) py = srch - 2;
+
             unsigned char *sp = srcpixels + py * srcpitch + px * 4;
 
             unsigned int yfrac = (syi >> 8) & 0xff; // ((short) sy) & 0xff;

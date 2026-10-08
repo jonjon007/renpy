@@ -539,8 +539,13 @@ def draw_transformed(dest, clip, what, xo, yo, alpha, forward, reverse):
         else:
             dest = dest.subsurface((minx, miny, maxx - minx, maxy - miny))
 
+            # precise=True requires a 1px border around the source surface for
+            # bilinear interpolation. On Xbox (SW renderer), some surfaces lack
+            # this border, causing out-of-bounds reads in transform32_std.
+            precise = not os.environ.get("RENPY_PLATFORM", "").startswith("xbox")
+
             renpy.display.module.self(
-                what, dest, cx, cy, forward.xdx, forward.ydx, forward.xdy, forward.ydy, alpha, True
+                what, dest, cx, cy, forward.xdx, forward.ydx, forward.xdy, forward.ydy, alpha, precise
             )
 
         return
@@ -683,9 +688,11 @@ class SWDraw(object):
         return 0, 0
 
     def init(self, virtual_size):
-        # These disable a failed load of ANGLE.
-        pygame.display.gl_reset_attributes()
-        pygame.display.hint("SDL_OPENGL_ES_DRIVER", "0")
+
+        # Skip GL-related calls on Xbox — no OpenGL exists
+        if not os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+            pygame.display.gl_reset_attributes()
+            pygame.display.hint("SDL_OPENGL_ES_DRIVER", "0")
 
         # Reset before resize.
         self.reset()
@@ -707,7 +714,17 @@ class SWDraw(object):
         scaled_width = int(width * scale_factor)
         scaled_height = int(height * scale_factor)
 
-        self.screen = pygame.display.set_mode((scaled_width, scaled_height), 0, 32)
+        flags = 0
+        if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+            flags = pygame.FULLSCREEN
+
+        self.screen = pygame.display.set_mode((scaled_width, scaled_height), flags, 32)
+
+        # Prime the D3D12 presentation pipeline on Xbox — present one black frame
+        # immediately so the swapchain is in a known good state.
+        if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+            self.screen.fill((0, 0, 0))
+            pygame.display.flip()
 
         if scale_factor != 1.0:
             self.window = surface(width, height, True)
@@ -816,10 +833,19 @@ class SWDraw(object):
 
         return True
 
+    _xbox_diag_done = False
+
     def draw_screen(self, surftree):
         """
         Draws the screen.
         """
+
+        # On Xbox (D3D12 swapchain), we must redraw the full frame every time.
+        # The swapchain rotates between multiple backbuffers, so partial updates
+        # leave undamaged regions showing stale/garbage content.
+        xbox = os.environ.get("RENPY_PLATFORM", "").startswith("xbox")
+        if xbox:
+            self.full_redraw = True
 
         updates = []
 
@@ -831,7 +857,10 @@ class SWDraw(object):
         self.full_redraw = False
 
         if self.window is self.screen:
-            pygame.display.update(updates)
+            if xbox:
+                pygame.display.flip()
+            else:
+                pygame.display.update(updates)
 
         else:
             renpy.display.scale.smoothscale(self.window, self.screen.get_size(), self.screen)
@@ -839,8 +868,11 @@ class SWDraw(object):
             pygame.display.flip()
 
     def render_to_texture(self, render, alpha):
-        rv = surface(render.width, render.height, alpha)
-        draw(rv, None, render, 0, 0, False)
+        # Add a 1px border so bilinear interpolation in transform32_std
+        # can safely read the 2x2 pixel grid at surface edges.
+        bordered = surface(render.width + 2, render.height + 2, alpha)
+        draw(bordered, None, render, 1, 1, False)
+        rv = bordered.subsurface((1, 1, render.width, render.height))
 
         return rv
 
@@ -864,9 +896,16 @@ class SWDraw(object):
         Creates a texture from the surface. In the software implementation,
         the only difference between a texture and a surface is that a texture
         is in the RLE cache.
+
+        The texture is wrapped in a 1px border so bilinear interpolation
+        in transform32_std can safely read the 2x2 pixel grid at edges.
         """
 
-        return surf.convert_alpha(self.screen)
+        converted = surf.convert_alpha(self.screen)
+        w, h = converted.get_size()
+        bordered = surface(w + 2, h + 2, True)
+        bordered.blit(converted, (1, 1))
+        return bordered.subsurface((1, 1, w, h))
 
     def ready_one_texture(self):
         return False
