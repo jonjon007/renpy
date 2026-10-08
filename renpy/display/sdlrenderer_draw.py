@@ -871,7 +871,7 @@ class SDLRendererDraw:
 
         # Draw bottom scene at full effective alpha
         if isinstance(bottom_render, renpy.display.render.Render):
-            self._draw_render(bottom_render, x, y, effective_alpha, None)
+            self._draw_transformed(bottom_render, x, y, effective_alpha)
         else:
             tex = self._get_texture(bottom_render)
             if tex is not None:
@@ -887,7 +887,7 @@ class SDLRendererDraw:
         top_alpha = complete * effective_alpha
         if top_alpha > 0.001:
             if isinstance(top_render, renpy.display.render.Render):
-                self._draw_render(top_render, x, y, top_alpha, None)
+                self._draw_transformed(top_render, x, y, top_alpha)
             else:
                 tex = self._get_texture(top_render)
                 if tex is not None:
