@@ -700,8 +700,10 @@ fix_dlc("renios", "renios")
             # Add Python (with the same name as our executables)
             self.add_python()
 
-            # Build the mac app and windows exes.
-            self.add_mac_files()
+            # Build the mac app and windows exes. (Windows-only SDKs have no Mac runtime.)
+            if os.path.exists(os.path.join(config.renpy_base, py("lib/py{major}-mac-universal/renpy"))):
+                self.add_mac_files()
+
             self.add_windows_files()
 
             # Add the main.py.
@@ -1157,11 +1159,16 @@ fix_dlc("renios", "renios")
                     i686fn,
                     True)
 
-            self.add_file(
-                linux,
-                prefix + "linux-x86_64/" + self.executable_name,
-                os.path.join(config.renpy_base, prefix + "linux-x86_64/renpy"),
-                True)
+            # Windows-only SDKs (such as the Xbox fork's) don't ship the Linux and Mac runtimes.
+            linuxfn = os.path.join(config.renpy_base, prefix + "linux-x86_64/renpy")
+
+            if os.path.exists(linuxfn):
+
+                self.add_file(
+                    linux,
+                    prefix + "linux-x86_64/" + self.executable_name,
+                    linuxfn,
+                    True)
 
             aarch64fn = os.path.join(config.renpy_base, prefix + "linux-aarch64/renpy")
 
@@ -1173,11 +1180,15 @@ fix_dlc("renios", "renios")
                     aarch64fn,
                     True)
 
-            self.add_file(
-                mac,
-                prefix + "mac-universal/" + self.executable_name,
-                os.path.join(config.renpy_base, prefix + "mac-universal/renpy"),
-                True)
+            macfn = os.path.join(config.renpy_base, prefix + "mac-universal/renpy")
+
+            if os.path.exists(macfn):
+
+                self.add_file(
+                    mac,
+                    prefix + "mac-universal/" + self.executable_name,
+                    macfn,
+                    True)
 
         def add_mac_files(self):
             """

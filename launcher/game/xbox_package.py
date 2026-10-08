@@ -29,9 +29,17 @@ same layout in ``dist\\xbox\\`` with make_xbox_dlc.ps1. This module doesn't
 depend on Ren'Py, so it can be tested with a plain Python interpreter.
 """
 
+import glob
+import hashlib
 import io
 import json
 import os
+import re
+import shutil
+import subprocess
+import sys
+
+import xml.etree.ElementTree as ET
 
 import xbox_config
 
@@ -162,3 +170,656 @@ def check_dlc(dlc, target, renpy_version=None):
 
     rv.extend(check_runtime(dlc, target))
     return rv
+
+
+def find_dlc(sdk, xbox_build=None):
+    """
+    Returns (path, dev) for the xbox DLC to build with, or (None, False) if
+    there isn't one. An xbox-build checkout's dist\\xbox is preferred (dev
+    mode: `dev` is True and the version check should be skipped), then the
+    DLC installed in the SDK.
+    """
+
+    if xbox_build:
+        d = os.path.join(xbox_build, "dist", "xbox")
+        if os.path.isfile(os.path.join(d, DLC_INFO)):
+            return d, True
+
+    d = dlc_path(sdk)
+    if os.path.isfile(os.path.join(d, DLC_INFO)):
+        return d, False
+
+    return None, False
+
+
+class XboxBuildError(Exception):
+    """
+    A build step failed. The message is meant to be shown to the user.
+    """
+
+
+################################################################################
+# Staging
+
+
+def _up_to_date(src, dst):
+    try:
+        s = os.stat(src)
+        d = os.stat(dst)
+    except OSError:
+        return False
+
+    return s.st_size == d.st_size and int(d.st_mtime) >= int(s.st_mtime)
+
+
+def copy_tree(src, dst, incremental=False, skip=(), include=None):
+    """
+    Copies the files under `src` into `dst`, merging with what's there.
+    __pycache__ directories are skipped.
+
+    `incremental`
+        If true, files whose copy has the same size and isn't older are
+        skipped.
+
+    `skip`
+        Names of top-level files and directories to leave out.
+
+    `include`
+        If given, a function that takes a path relative to `src` (with
+        forward slashes) and returns true if the file should be copied.
+
+    Returns the number of files copied.
+    """
+
+    rv = 0
+
+    for dirpath, dirnames, filenames in os.walk(src):
+        rel = os.path.relpath(dirpath, src)
+        rel = "" if rel == "." else rel
+
+        if not rel:
+            dirnames[:] = [ i for i in dirnames if i not in skip ]
+            filenames = [ i for i in filenames if i not in skip ]
+
+        dirnames[:] = [ i for i in dirnames if i != "__pycache__" ]
+
+        for fn in filenames:
+            relfn = os.path.join(rel, fn)
+
+            if include is not None and not include(relfn.replace(os.sep, "/")):
+                continue
+
+            s = os.path.join(src, relfn)
+            d = os.path.join(dst, relfn)
+
+            if incremental and _up_to_date(s, d):
+                continue
+
+            os.makedirs(os.path.dirname(d), exist_ok=True)
+            shutil.copy2(s, d)
+            rv += 1
+
+    return rv
+
+
+def stage_runtime(dlc, target, layout, incremental=False):
+    """
+    Copies the DLC runtime for `target` into `layout`, then lays its
+    overrides over layout\\renpy. The layout must already contain renpy\\.
+    Returns the number of files copied.
+    """
+
+    if not os.path.isfile(os.path.join(layout, "renpy", "__init__.py")):
+        raise XboxBuildError("{} doesn't contain Ren'Py (renpy\\__init__.py).".format(layout))
+
+    rt = runtime_path(dlc, target)
+    rv = copy_tree(rt, layout, incremental, skip=("overrides",))
+
+    overrides = os.path.join(rt, "overrides")
+    if os.path.isdir(overrides):
+        rv += copy_tree(overrides, layout, incremental)
+
+    return rv
+
+
+def stage_renpy_source(renpy_root, layout, incremental=False):
+    """
+    Copies Ren'Py's Python code and renpy\\common from a Ren'Py checkout or
+    SDK at `renpy_root` into layout\\renpy. (The launcher uses the
+    Distributor instead, which also honors the project's build settings.)
+    """
+
+    def include(rel):
+        return rel.startswith("common/") or rel.endswith(".py")
+
+    return copy_tree(os.path.join(renpy_root, "renpy"), os.path.join(layout, "renpy"), incremental, include=include)
+
+
+def stage_game(game, layout, incremental=False):
+    """
+    Copies a game directory into layout\\game, leaving out saves.
+    """
+
+    if not os.path.isdir(game):
+        raise XboxBuildError("The game directory {} doesn't exist.".format(game))
+
+    return copy_tree(game, os.path.join(layout, "game"), incremental, skip=("saves",))
+
+
+def write_vc_version(layout, version_dict):
+    """
+    Writes layout\\renpy\\vc_version.py (as renpy.versions.generate_vc_version
+    does) if it doesn't exist, so the console doesn't need git to know
+    Ren'Py's version. `version_dict` is renpy.version_dict, or the result of
+    renpy.versions.get_git_version().
+    """
+
+    path = os.path.join(layout, "renpy", "vc_version.py")
+
+    if os.path.exists(path):
+        return False
+
+    lines = [ "branch = {!r}".format(version_dict["branch"]) ]
+
+    if version_dict.get("dirty"):
+        lines.append("dirty = True")
+
+    lines.append("official = {!r}".format(bool(version_dict.get("official"))))
+    lines.append("nightly = {!r}".format(bool(version_dict.get("nightly"))))
+    lines.append("version = {!r}".format(version_dict["version"].split("+")[0]))
+    lines.append("version_name = {!r}".format(version_dict["name"]))
+
+    with io.open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    return True
+
+
+def git_version_dict(renpy_root):
+    """
+    Computes Ren'Py's version dict from the git checkout at `renpy_root`,
+    using renpy\\versions.py without importing Ren'Py.
+    """
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_xbox_renpy_versions", os.path.join(renpy_root, "renpy", "versions.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    old = os.getcwd()
+    os.chdir(renpy_root)
+
+    try:
+        return module.get_git_version()
+    finally:
+        os.chdir(old)
+
+
+def stage_gameconfig(config, layout, target):
+    """
+    Copies MicrosoftGame.config into `layout` (for xboxone, the Scarlett
+    TargetDeviceFamily is rewritten to XboxOne) along with every
+    ShellVisuals image it references, from the config's folder. Images that
+    don't exist get a 1x1 placeholder so makepkg can still pack a dev build.
+
+    Returns a list of warnings.
+    """
+
+    if os.path.isdir(config):
+        config = os.path.join(config, xbox_config.CONFIG_NAME)
+
+    if not os.path.isfile(config):
+        raise XboxBuildError("{} was not found.".format(config))
+
+    with open(config, "rb") as f:
+        data = f.read()
+
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as e:
+        raise XboxBuildError("{} is not well-formed XML: {}".format(config, e))
+
+    if target == "xboxone":
+        data = re.sub(br"""(TargetDeviceFamily\s*=\s*["'])Scarlett""", br"\1XboxOne", data)
+
+    os.makedirs(layout, exist_ok=True)
+    layout = os.path.abspath(layout)
+
+    with open(os.path.join(layout, xbox_config.CONFIG_NAME), "wb") as f:
+        f.write(data)
+
+    rv = [ ]
+
+    for attr, rel in xbox_config.referenced_images(root):
+        src = xbox_config.image_path(config, rel)
+        dst = os.path.normpath(os.path.join(layout, rel.replace("/", os.sep)))
+
+        if os.path.commonpath([ layout, dst ]) != layout:
+            raise XboxBuildError("{} '{}' points outside the package.".format(attr, rel))
+
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+        if os.path.isfile(src):
+            shutil.copyfile(src, dst)
+        else:
+            rv.append("{} '{}' was not found next to the config; using a 1x1 placeholder.".format(attr, rel))
+
+            with open(dst, "wb") as f:
+                f.write(xbox_config.placeholder_png())
+
+    return rv
+
+
+PRECOMPILE_DIRS = ("renpy", "pygame_sdl2", os.path.join("lib", "python3.12"))
+
+
+def can_precompile():
+    """
+    The console runs CPython 3.12, so only a 3.12 interpreter (like the
+    launcher's) can write .pyc files it will load.
+    """
+
+    return sys.version_info[:2] == (3, 12)
+
+
+def precompile(layout, incremental=False):
+    """
+    Writes hash-checked .pyc files for the Python code in `layout`, since the
+    console can't write them to the read-only package. Returns the number of
+    files compiled (0 if this interpreter isn't CPython 3.12).
+    """
+
+    import py_compile
+
+    if not can_precompile():
+        return 0
+
+    tag = sys.implementation.cache_tag
+    rv = 0
+
+    for d in PRECOMPILE_DIRS:
+        for dirpath, dirnames, filenames in os.walk(os.path.join(layout, d)):
+            dirnames[:] = [ i for i in dirnames if i != "__pycache__" ]
+
+            for fn in filenames:
+                if not fn.endswith(".py"):
+                    continue
+
+                src = os.path.join(dirpath, fn)
+                pyc = os.path.join(dirpath, "__pycache__", "{}.{}.pyc".format(fn[:-3], tag))
+
+                if incremental and os.path.exists(pyc) and os.path.getmtime(pyc) >= os.path.getmtime(src):
+                    continue
+
+                try:
+                    py_compile.compile(src, cfile=pyc, doraise=True,
+                        invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH)
+                    rv += 1
+                except py_compile.PyCompileError:
+                    pass
+
+    return rv
+
+
+################################################################################
+# Package identity
+
+
+_PUBLISHER_ID_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz"
+
+
+def publisher_id(publisher):
+    """
+    Returns the package publisher ID for `publisher` (e.g. "CN=Developer"):
+    the first 8 bytes of SHA-256 of its UTF-16LE form, plus a zero bit,
+    as 13 base32 characters.
+    """
+
+    digest = hashlib.sha256(publisher.encode("utf-16-le")).digest()[:8]
+    bits = int.from_bytes(digest, "big") << 1
+
+    return "".join(_PUBLISHER_ID_ALPHABET[(bits >> (60 - 5 * i)) & 31] for i in range(13))
+
+
+def package_identity(config):
+    """
+    Returns a dict with the package identifiers derived from `config`:
+    name, version, publisher_id, aumid (for xbapp launch), full_name
+    (xbapp uninstall/suspend/resume), and family_name.
+    """
+
+    try:
+        root = ET.parse(config).getroot()
+    except (OSError, ET.ParseError) as e:
+        raise XboxBuildError("Could not read {}: {}".format(config, e))
+
+    identity = xbox_config._child(root, "Identity")
+
+    if identity is None:
+        raise XboxBuildError("{} has no Identity element.".format(config))
+
+    executables = xbox_config._child(root, "ExecutableList")
+    exe = xbox_config._child(executables, "Executable") if executables is not None else None
+
+    name = identity.get("Name", "")
+    version = identity.get("Version") or "1.0.0.0"
+    pub = publisher_id(identity.get("Publisher", ""))
+    app = (exe.get("Id") if exe is not None else None) or "Game"
+
+    return {
+        "name" : name,
+        "version" : version,
+        "publisher_id" : pub,
+        "aumid" : "{}_{}!{}".format(name, pub, app),
+        "full_name" : "{}_{}_neutral__{}".format(name, version, pub),
+        "family_name" : "{}_{}".format(name, pub),
+    }
+
+
+################################################################################
+# GDK tools
+
+
+def gameos_path(gdk):
+    return os.path.join(gdk, "xbox", "redist", "GameOS.xvd")
+
+
+def find_gdk(environ=None):
+    """
+    Returns the GDK edition directory (e.g. ...\\Microsoft GDK\\260402) that
+    has the console GameOS, or None. Prefers GDK_DIR, then GameDKXboxLatest,
+    then the newest installed edition.
+    """
+
+    if environ is None:
+        environ = os.environ
+
+    candidates = [ environ.get("GDK_DIR"), environ.get("GameDKXboxLatest") ]
+
+    pf86 = environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    editions = glob.glob(os.path.join(pf86, "Microsoft GDK", "[0-9]*"))
+    editions.sort(key=os.path.basename, reverse=True)
+    candidates.extend(editions)
+
+    for c in candidates:
+        if c and os.path.isfile(gameos_path(c)):
+            return os.path.abspath(c)
+
+    return None
+
+
+def gdk_edition(gdk):
+    return os.path.basename(os.path.normpath(gdk)) if gdk else ""
+
+
+def _tool(exe):
+    rv = xbox_config.find_gdk_tool(exe)
+
+    if rv is None:
+        raise XboxBuildError("{} was not found. Install the Microsoft GDK with the Xbox extensions.".format(exe))
+
+    return rv
+
+
+def run(cmd, log=None):
+    """
+    Runs `cmd`, sending its output to the file `log` (or this process's
+    output if None). Returns the exit code.
+    """
+
+    line = "\n> " + subprocess.list2cmdline(cmd) + "\n\n"
+
+    if log is None:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        return subprocess.call(cmd)
+
+    log.write(line)
+    log.flush()
+
+    return subprocess.call(cmd, stdout=log, stderr=subprocess.STDOUT,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def pack(layout, package_dir, gdk, log=None, mapfile=None):
+    """
+    Runs makepkg genmap and pack on `layout`, writing the package to
+    `package_dir`. Returns the path to the .xvc.
+    """
+
+    makepkg = _tool("makepkg.exe")
+    gameos = gameos_path(gdk)
+
+    if not os.path.isfile(gameos):
+        raise XboxBuildError("{} was not found.".format(gameos))
+
+    # A loose deploy copies GameOS.xvd into the layout; packages get it via /gameos.
+    stale = os.path.join(layout, "GameOS.xvd")
+    if os.path.exists(stale):
+        os.unlink(stale)
+
+    if mapfile is None:
+        mapfile = os.path.join(os.path.dirname(os.path.abspath(layout)), "layout.xml")
+
+    os.makedirs(package_dir, exist_ok=True)
+
+    for old in glob.glob(os.path.join(package_dir, "*.xvc")):
+        os.unlink(old)
+
+    if run([ makepkg, "genmap", "/f", mapfile, "/d", layout ], log):
+        raise XboxBuildError("makepkg genmap failed. See the log for details.")
+
+    if run([ makepkg, "pack", "/v", "/f", mapfile, "/d", layout, "/pd", package_dir,
+            "/gameos", gameos, "/skipvalidation", "/skipsymbolbundling" ], log):
+        raise XboxBuildError("makepkg pack failed. See the log for details.")
+
+    return find_package(package_dir)
+
+
+def find_package(package_dir):
+    xvcs = glob.glob(os.path.join(package_dir, "*.xvc"))
+
+    if not xvcs:
+        raise XboxBuildError("No .xvc package was found in {}.".format(package_dir))
+
+    return max(xvcs, key=os.path.getmtime)
+
+
+def validate(layout, package_dir, log=None):
+    """
+    Runs makepkg validate on `layout`. Returns the exit code.
+    """
+
+    makepkg = _tool("makepkg.exe")
+    os.makedirs(package_dir, exist_ok=True)
+    return run([ makepkg, "validate", "/d", layout, "/pd", package_dir ], log)
+
+
+def _xbapp(args, log=None, console=None):
+    cmd = [ _tool("xbapp.exe") ]
+
+    if console:
+        cmd.append("/x:" + console)
+
+    return run(cmd + args, log)
+
+
+def install(xvc, log=None, console=None):
+    """
+    Installs a package on the devkit (xbapp install).
+    """
+
+    if _xbapp([ "install", xvc ], log, console):
+        raise XboxBuildError("xbapp install failed. Check that the devkit is connected (xbconnect) and see the log.")
+
+
+def deploy(layout, gdk, log=None, console=None):
+    """
+    Deploys a loose layout to the devkit (xbapp deploy). Loose deploys need
+    GameOS.xvd in the layout.
+    """
+
+    gameos = gameos_path(gdk)
+
+    if not os.path.isfile(gameos):
+        raise XboxBuildError("{} was not found.".format(gameos))
+
+    dst = os.path.join(layout, "GameOS.xvd")
+
+    if not _up_to_date(gameos, dst):
+        shutil.copy2(gameos, dst)
+
+    if _xbapp([ "deploy", layout ], log, console):
+        raise XboxBuildError("xbapp deploy failed. Check that the devkit is connected (xbconnect) and see the log.")
+
+
+def launch(aumid, log=None, console=None):
+    """
+    Launches an installed title on the devkit (xbapp launch).
+    """
+
+    if _xbapp([ "launch", aumid ], log, console):
+        raise XboxBuildError("xbapp launch {} failed. See the log for details.".format(aumid))
+
+
+def full_validation(config, dlc, target, workdir, log=None):
+    """
+    Stages the DLC runtime and `config` (with its images) into
+    `workdir`\\Loose, then runs makepkg validate. Returns makepkg's exit code.
+    """
+
+    loose = os.path.join(workdir, "Loose")
+
+    if os.path.isdir(loose):
+        shutil.rmtree(loose)
+
+    rt = runtime_path(dlc, target)
+    copy_tree(rt, loose, skip=("overrides",))
+
+    for w in stage_gameconfig(config, loose, target):
+        if log is not None:
+            log.write("Warning: " + w + "\n")
+
+    return validate(loose, os.path.join(workdir, "Package"), log)
+
+
+################################################################################
+# Command line (used by xbox-build's package_xbox.bat and quick_deploy.bat)
+
+
+def _main(argv=None):
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="xbox_package.py", description="Stage, package and deploy Ren'Py games for Xbox.")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    sp = sub.add_parser("stage", help="Stage a game into a loose layout.")
+    sp.add_argument("--target", choices=sorted(xbox_config.GDK_PLATFORMS), default="scarlett")
+    sp.add_argument("--dlc", required=True, help="The xbox DLC (or make_xbox_dlc.ps1 output) directory.")
+    sp.add_argument("--layout", required=True, help="The loose layout directory to create.")
+    sp.add_argument("--renpy", required=True, help="The Ren'Py checkout or SDK to take renpy\\ from.")
+    sp.add_argument("--project", help="A project directory (with game\\ and xbox\\MicrosoftGame.config).")
+    sp.add_argument("--game", help="A game directory, if --project isn't given.")
+    sp.add_argument("--config", help="MicrosoftGame.config (or its folder). Defaults to the project's.")
+    sp.add_argument("--incremental", action="store_true", help="Update an existing layout instead of recreating it.")
+    sp.add_argument("--bootstrap", help="A script to use as renpy.py instead of the runtime's (e.g. a smoke test).")
+
+    sp = sub.add_parser("pack", help="Package a loose layout into an .xvc.")
+    sp.add_argument("--layout", required=True)
+    sp.add_argument("--package-dir", required=True)
+    sp.add_argument("--map", help="Where to write layout.xml.")
+
+    sp = sub.add_parser("install", help="Install the newest .xvc in a directory on the devkit.")
+    sp.add_argument("--package-dir", required=True)
+
+    sp = sub.add_parser("deploy", help="Deploy a loose layout to the devkit.")
+    sp.add_argument("--layout", required=True)
+
+    sp = sub.add_parser("launch", help="Launch the title described by a MicrosoftGame.config.")
+    sp.add_argument("--config", required=True)
+
+    sp = sub.add_parser("id", help="Print a package identifier.")
+    sp.add_argument("--config", required=True)
+    sp.add_argument("--part", choices=[ "aumid", "full_name", "family_name", "publisher_id" ], default="aumid")
+
+    args = ap.parse_args(argv)
+
+    try:
+        if args.command == "stage":
+            config = args.config
+            game = args.game
+
+            if args.project:
+                game = game or os.path.join(args.project, "game")
+                config = config or xbox_config.config_path(args.project)
+
+            if not game or not config:
+                raise XboxBuildError("Give --project, or both --game and --config.")
+
+            problems = check_runtime(args.dlc, args.target)
+            if problems:
+                raise XboxBuildError("\n".join(problems))
+
+            if not args.incremental and os.path.isdir(args.layout):
+                shutil.rmtree(args.layout)
+
+            n = stage_renpy_source(args.renpy, args.layout, args.incremental)
+            print("  renpy\\: {} files".format(n))
+
+            n = stage_game(game, args.layout, args.incremental)
+            print("  game\\: {} files from {}".format(n, game))
+
+            n = stage_runtime(args.dlc, args.target, args.layout, args.incremental)
+            print("  runtime: {} files".format(n))
+
+            if args.bootstrap:
+                shutil.copyfile(args.bootstrap, os.path.join(args.layout, "renpy.py"))
+                print("  renpy.py replaced with {}".format(args.bootstrap))
+
+            if not os.path.exists(os.path.join(args.layout, "renpy", "vc_version.py")):
+                write_vc_version(args.layout, git_version_dict(args.renpy))
+                print("  renpy\\vc_version.py written")
+
+            for w in stage_gameconfig(config, args.layout, args.target):
+                print("  WARN: " + w)
+
+            print("  MicrosoftGame.config staged from {}".format(config))
+
+            n = precompile(args.layout, args.incremental)
+            if can_precompile():
+                print("  {} .pyc files compiled".format(n))
+
+        elif args.command == "pack":
+            gdk = find_gdk()
+            if gdk is None:
+                raise XboxBuildError("No GDK with Xbox extensions (xbox\\redist\\GameOS.xvd) was found.")
+
+            xvc = pack(args.layout, args.package_dir, gdk, mapfile=args.map)
+            print("\nPackage: {} ({:,} bytes)".format(xvc, os.path.getsize(xvc)))
+
+        elif args.command == "install":
+            install(find_package(args.package_dir))
+
+        elif args.command == "deploy":
+            gdk = find_gdk()
+            if gdk is None:
+                raise XboxBuildError("No GDK with Xbox extensions (xbox\\redist\\GameOS.xvd) was found.")
+
+            deploy(args.layout, gdk)
+
+        elif args.command == "launch":
+            launch(package_identity(args.config)["aumid"])
+
+        elif args.command == "id":
+            print(package_identity(args.config)[args.part])
+
+    except XboxBuildError as e:
+        print("ERROR: {}".format(e), file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main())

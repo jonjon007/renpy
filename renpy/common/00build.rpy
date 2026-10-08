@@ -213,6 +213,9 @@ init -1500 python in build:
 
         ("steam_appid.txt", None),
 
+        # The Xbox screen's MicrosoftGame.config and logos, staged separately.
+        ("xbox/", None),
+
         ("game/" + renpy.script.BYTECODE_FILE, "all"),
         ("game/cache/bytecode-*.rpyb", None),
         ("game/cache/build_info.json", None),
@@ -425,6 +428,7 @@ init -1500 python in build:
     package("android", "directory", "android all", hidden=True, update=False, dlc=True)
     package("ios", "directory", "ios all", hidden=True, update=False, dlc=True)
     package("web", "zip", "web renpy all", hidden=True, update=False, dlc=True)
+    package("xbox", "directory", "xbox renpy all", hidden=True, update=False, dlc=True)
 
     # Data that we expect the user to set.
 

@@ -32,10 +32,14 @@ default persistent.xbox_config_editor = "auto"
 # The xbox-build checkout, or None to use RENPY_XBOX_BUILD / auto-detection.
 default persistent.xbox_build_dir = None
 
+# The console to build for: "scarlett" (Xbox Series X|S) or "xboxone".
+default persistent.xbox_target = "scarlett"
+
 init python:
 
     import subprocess
     import xbox_config
+    import xbox_package
 
     XBOX_TEMPLATE = os.path.join(config.gamedir, "xbox", "MicrosoftGame.config.template")
     # The validation issue list scrolls past this many issues / this height,
@@ -73,6 +77,14 @@ init python:
 
     def xbox_build_dir():
         return xbox_config.find_xbox_build(persistent.xbox_build_dir, renpy_base=config.renpy_base)
+
+    def xbox_dlc():
+        """
+        Returns (path, dev) for the xbox DLC: an xbox-build checkout's
+        dist\\xbox (dev mode), else the DLC installed in the SDK.
+        """
+
+        return xbox_package.find_dlc(config.renpy_base, xbox_build_dir())
 
     def xbox_template():
         return xbox_config.template_path(xbox_build_dir(), XBOX_TEMPLATE)
@@ -572,13 +584,19 @@ label xbox_full_validate:
 
     python hide:
         path = xbox_config_path()
-        build_dir = xbox_build_dir()
+        dlc, dev = xbox_dlc()
+        target = persistent.xbox_target
 
         if not os.path.exists(path):
             interface.error(_("There is no MicrosoftGame.config yet. Use Edit Game Config to create one."), label="xbox")
 
-        if build_dir is None:
-            interface.error(_("Full validation stages the config into an xbox-build layout. Set the xbox-build folder in Preferences > Xbox, or set RENPY_XBOX_BUILD."), label="xbox")
+        if dlc is None:
+            interface.error(_("Full validation needs Xbox support (the xbox DLC) to be installed."), label="xbox")
+
+        problems = xbox_package.check_runtime(dlc, target)
+
+        if problems:
+            interface.error(_("The xbox DLC is incomplete:\n[problems!q]"), problems="\n".join(problems), label="xbox")
 
         report = xbox_report(force=True)
 
@@ -586,11 +604,13 @@ label xbox_full_validate:
             interface.error(_("Fix the errors listed under Validation first."), label="xbox")
 
         log = project.current.temp_filename("xbox_validate.txt")
+        workdir = project.current.temp_filename("xbox_validate")
 
         interface.processing(_("Staging the config and running makepkg validate. This can take a minute..."))
 
         try:
-            rc = xbox_config.full_validation(path, build_dir, log)
+            with open(log, "w", encoding="utf-8") as f:
+                rc = xbox_package.full_validation(path, dlc, target, workdir, f)
         except Exception as e:
             interface.error(_("Full validation could not run."), _("[exception!q]"), exception=str(e), label="xbox")
 

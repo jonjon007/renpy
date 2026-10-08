@@ -29,13 +29,11 @@ Python interpreter.
 """
 
 import collections
-import contextlib
 import glob
 import os
 import re
 import shutil
 import struct
-import subprocess
 import sys
 import zlib
 
@@ -625,111 +623,3 @@ def _validate_xbox_live(root, rv):
         rv.add(INFO, "The native Xbox launcher derives SCID {} from TitleId; Connected Storage must be enabled in Partner Center.".format(derived))
         if scid is not None and GUID_RE.match((scid.text or "").strip()) and (scid.text or "").strip().lower() != derived:
             rv.add(WARNING, "SaveGameStorage SCID differs from the TitleId-derived SCID used by the native Xbox launcher.")
-
-
-################################################################################
-# Packaging helpers
-
-
-def loose_dir(xbox_build, target="scarlett"):
-    return os.path.join(xbox_build, "output", GDK_PLATFORMS[target], "Layout", "Image", "Loose")
-
-
-@contextlib.contextmanager
-def _preserve_loose_config(loose, config):
-    """
-    Restores the Loose layout's MicrosoftGame.config and the images staging
-    may touch (top-level PNGs and anything `config` references) on exit, so
-    validating one project's config doesn't change what the next quick
-    deploy sends (or its AUMID).
-    """
-
-    referenced = set()
-
-    try:
-        for _attr, rel in referenced_images(ET.parse(config).getroot()):
-            referenced.add(os.path.normpath(rel.replace("/", os.sep)))
-    except Exception:
-        pass
-
-    def snapshot_names():
-        try:
-            rv = set(n for n in os.listdir(loose) if n == "MicrosoftGame.config" or n.lower().endswith(".png"))
-        except OSError:
-            rv = set()
-
-        return rv | set(n for n in referenced if os.path.isfile(os.path.join(loose, n)))
-
-    saved = { }
-
-    for n in snapshot_names():
-        fn = os.path.join(loose, n)
-        if os.path.isfile(fn):
-            with open(fn, "rb") as f:
-                saved[n] = f.read()
-
-    try:
-        yield
-    finally:
-        for n in snapshot_names() - set(saved):
-            try:
-                os.unlink(os.path.join(loose, n))
-            except OSError:
-                pass
-
-        for n, data in saved.items():
-            try:
-                with open(os.path.join(loose, n), "wb") as f:
-                    f.write(data)
-            except OSError:
-                pass
-
-
-def full_validation(config, xbox_build, log_path, target="scarlett", makepkg=None):
-    """
-    Stages `config` (and its images) into xbox-build's existing Loose layout,
-    then runs `makepkg validate`. The Loose layout's own config and logos are
-    restored afterwards. Output goes to `log_path`. Returns the
-    makepkg exit code (or the staging script's, if staging failed).
-
-    Raises an Exception with a user-readable message if prerequisites are
-    missing.
-    """
-
-    makepkg = makepkg or find_makepkg()
-    if makepkg is None:
-        raise Exception("makepkg.exe was not found. Install the Microsoft GDK.")
-
-    loose = loose_dir(xbox_build, target)
-    if not os.path.isfile(os.path.join(loose, EXECUTABLE_NAME)):
-        raise Exception("No staged layout at {}. Run package_xbox.bat {} once first.".format(loose, target))
-
-    stage = os.path.join(xbox_build, "scripts", "stage_gameconfig.ps1")
-    if not os.path.isfile(stage):
-        raise Exception("{} is missing.".format(stage))
-
-    pkgdir = os.path.join(os.path.dirname(log_path), "xbox-validate")
-    if os.path.isdir(pkgdir):
-        shutil.rmtree(pkgdir, ignore_errors=True)
-    os.makedirs(pkgdir)
-
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-    with open(log_path, "w", encoding="utf-8", errors="replace") as log, _preserve_loose_config(loose, config):
-        log.write("Staging {} into {}\n\n".format(config, loose))
-        log.flush()
-
-        rc = subprocess.call(
-            [ "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", stage,
-                "-Config", config, "-Loose", loose, "-Target", target ],
-            stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
-
-        if rc:
-            return rc
-
-        log.write("\n> makepkg validate /d {} /pd {}\n\n".format(loose, pkgdir))
-        log.flush()
-
-        return subprocess.call(
-            [ makepkg, "validate", "/d", loose, "/pd", pkgdir ],
-            stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
