@@ -432,6 +432,9 @@ def main():
     if renpy.game.args.savedir:  # type: ignore
         renpy.config.savedir = renpy.game.args.savedir  # type: ignore
 
+    if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+        renpy.config.savedir = renpy.__main__.path_to_saves(renpy.config.gamedir)
+
     # Init the save token system.
     renpy.savetoken.init()
 
@@ -464,6 +467,8 @@ def main():
 
         # Load persistent data from all save locations.
         renpy.persistent.update()
+        if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+            renpy.__main__.xbox_merge_local_persistent()
         game.preferences = game.persistent._preferences
         log_clock("Loading persistent")
 
@@ -507,6 +512,11 @@ def main():
             i()
 
         renpy.config.post_init()
+        if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+            renpy.config.has_sync = False
+            renpy.config.keymap["screenshot"] = []
+            if renpy.__main__.xbox_save_notice not in renpy.config.display_start_callbacks:
+                renpy.config.display_start_callbacks.append(renpy.__main__.xbox_save_notice)
 
         renpy.game.script.report_duplicate_labels()
 

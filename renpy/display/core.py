@@ -2044,6 +2044,7 @@ class Interface:
         start = time.time()
 
         renpy.audio.audio.pause_all()
+        renpy.savelocation.quit()
 
         pygame.time.set_timer(PERIODIC, 0)
         pygame.time.set_timer(REDRAW, 0)
@@ -2059,6 +2060,7 @@ class Interface:
 
             traceback.print_exc()
 
+        renpy.__main__.xbox_stop_save_access()
         suspended = _xbox.suspend_renderer()
 
         print("PLM: suspending (save took %.3fs, renderer suspended=%s)." % (time.time() - start, suspended))
@@ -2080,6 +2082,7 @@ class Interface:
         print("PLM: resumed.")
 
         pygame.time.set_timer(PERIODIC, PERIODIC_INTERVAL)
+        renpy.__main__.xbox_refresh_saves()
 
         renpy.audio.audio.unpause_all()
 
@@ -3140,6 +3143,8 @@ class Interface:
                 # Handle periodic events. This includes updating the mouse timers (and through the loop,
                 # the mouse itself), and the audio system periodic calls.
                 if ev.type == PERIODIC:
+                    if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+                        renpy.__main__.xbox_poll_user()
                     events = 1 + len(pygame.event.get([PERIODIC]))
                     self.ticks += events
 

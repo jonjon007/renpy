@@ -100,7 +100,7 @@ define preference_tabs = (
     ("install", _("Install Libraries")),
     ("actions", _("Actions")),
     ("lint", _("Lint")),
-)
+) + ((("xbox", _("Xbox")),) if renpy.windows else ())
 
 screen preferences():
 
@@ -383,6 +383,19 @@ screen preferences():
                             textbutton _("Show all unreachable blocks and orphaned translations."):
                                 style "l_checkbox"
                                 action ToggleSetMembership(persistent.lint_options, "--all-problems")
+
+                elif preference_tab == "xbox":
+
+                    frame:
+                        style "l_indent"
+                        xmaximum TWOTHIRDS
+                        xfill True
+
+                        has vbox
+
+                        add SEPARATOR2
+
+                        use xbox_preferences
 
 
     textbutton _("Return") id "return_btn" action Jump("front_page") style "l_left_button"

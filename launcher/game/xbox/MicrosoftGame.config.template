@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Game configVersion="1">
+  <Identity Name="RenPyXbox"
+            Publisher="CN=Developer"
+            Version="1.0.0.0" />
+
+  <ExecutableList>
+    <Executable Name="renpy_xbox.exe"
+                TargetDeviceFamily="Scarlett"
+                Id="Game" />
+  </ExecutableList>
+
+  <ShellVisuals DefaultDisplayName="Ren'Py Xbox"
+                PublisherDisplayName="Developer"
+                StoreLogo="StoreLogo.png"
+                Square480x480Logo="Logo480.png"
+                Square150x150Logo="Logo150.png"
+                Square44x44Logo="Logo44.png"
+                SplashScreenImage="SplashScreen.png"
+                Description="Ren'Py Visual Novel Engine for Xbox"
+                BackgroundColor="#1a1a2e"
+                ForegroundText="light" />
+
+  <!-- Writable per-title storage for saves/logs (XPersistentLocalStorageGetPath) -->
+  <PersistentLocalStorage>
+    <SizeMB>256</SizeMB>
+  </PersistentLocalStorage>
+</Game>

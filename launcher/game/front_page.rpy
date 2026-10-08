@@ -231,6 +231,10 @@ screen front_page_project:
                 textbutton _("Android") action Jump("android")
                 textbutton _("iOS") action Jump("ios")
                 textbutton _("Web") action Jump("web")
+
+                if renpy.windows:
+                    textbutton _("Xbox") action Jump("xbox")
+
                 textbutton _("Generate Translations") action Jump("translate")
                 textbutton _("Extract Dialogue") action Jump("extract_dialogue")
 

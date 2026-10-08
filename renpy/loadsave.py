@@ -56,6 +56,11 @@ def safe_rename(old, new):
     Safely rename old to new.
     """
 
+    if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+        renpy.__main__.xbox_check_save_access()
+        os.replace(old, new)
+        return
+
     if os.path.exists(new):
         os.unlink(new)
 
@@ -96,6 +101,21 @@ class SaveRecord(object):
 
         filename_new = filename + ".new"
 
+        if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+            with io.BytesIO() as buffer:
+                self.write_zip(buffer)
+                data = buffer.getvalue()
+            renpy.__main__.xbox_check_save_write(filename, len(data))
+            try:
+                with open(filename_new, "wb") as f:
+                    f.write(data)
+                safe_rename(filename_new, filename)
+            finally:
+                if renpy.__main__.xbox_save_access_ready() and os.path.exists(filename_new):
+                    os.unlink(filename_new)
+            self.first_filename = filename
+            return
+
         # For speed, copy the file after we've written it at least once.
         if self.first_filename is not None:
             try:
@@ -107,7 +127,12 @@ class SaveRecord(object):
                 safe_rename(filename_new, filename)
                 return
 
-        with zipfile.ZipFile(filename_new, "w", zipfile.ZIP_DEFLATED) as zf:
+        self.write_zip(filename_new)
+        safe_rename(filename_new, filename)
+        self.first_filename = filename
+
+    def write_zip(self, destination):
+        with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as zf:
             # Screenshot.
             if self.screenshot is not None:
                 zf.writestr("screenshot.png", self.screenshot)
@@ -126,10 +151,6 @@ class SaveRecord(object):
 
             # The signatures.
             zf.writestr("signatures", renpy.savetoken.sign_data(self.log))
-
-        safe_rename(filename_new, filename)
-
-        self.first_filename = filename
 
 
 def save(slotname, extra_info="", mutate_flag=False, include_screenshot=True, extra_json=None):
@@ -190,7 +211,12 @@ def save(slotname, extra_info="", mutate_flag=False, include_screenshot=True, ex
             if bad := find_bad_reduction(**{"renpy.game.log": renpy.game.log}, **roots):
                 e.add_note(f"Perhaps bad reduction in {bad}")
         except Exception:
-            pass
+            if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+                renpy.display.log.write("Xbox autosave failed.")
+                renpy.display.log.exception()
+                renpy.exports.invoke_in_main_thread(
+                    renpy.exports.notify,
+                    renpy.translation.translate_string("Autosave failed. Check your sign-in and available save space."))
 
         raise
 

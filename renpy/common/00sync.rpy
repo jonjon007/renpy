@@ -37,8 +37,10 @@
 
 init -1100 python:
 
+    import os
+
     # True if Ren'Py's Save Sync is enabled, False otherwise.
-    config.has_sync = True
+    config.has_sync = not os.environ.get("RENPY_PLATFORM", "").startswith("xbox")
 
     # The server to sync against, to allow sync against a test server.
     config.sync_server = "https://sync.renpy.org"
@@ -74,7 +76,9 @@ init -1100 python:
 
 init 1100 python:
 
-    if config.savedir is not None:
+    if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+        config.has_sync = False
+    elif config.savedir is not None:
         config.extra_savedirs.append(config.savedir + "/sync")
     else:
         config.has_sync = None

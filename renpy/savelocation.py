@@ -39,6 +39,11 @@ import shutil
 
 disk_lock = threading.RLock()
 
+
+def check_xbox_access():
+    if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+        renpy.__main__.xbox_check_save_access()
+
 # A suffix used to disambguate temporary files being written by multiple
 # processes.
 import time
@@ -107,6 +112,7 @@ class FileLocation(object):
     """
 
     def __init__(self, directory):
+        check_xbox_access()
         self.directory = directory
 
         # Make the save directory.
@@ -163,8 +169,12 @@ class FileLocation(object):
 
         if not self.active:
             return
+        if os.environ.get("RENPY_PLATFORM", "").startswith("xbox") and not renpy.__main__.xbox_save_access_ready():
+            return
 
         with disk_lock:
+            if os.environ.get("RENPY_PLATFORM", "").startswith("xbox") and not renpy.__main__.xbox_save_access_ready():
+                return
             old_mtimes = self.mtimes
             new_mtimes = {}
 
@@ -255,6 +265,7 @@ class FileLocation(object):
         """
 
         with disk_lock:
+            check_xbox_access()
             fn = os.path.join(self.directory, filename)
 
             try:
@@ -270,6 +281,7 @@ class FileLocation(object):
         """
 
         with disk_lock:
+            check_xbox_access()
             try:
                 filename = self.filename(slotname)
                 with zipfile.ZipFile(filename, "r") as zf:
@@ -298,6 +310,7 @@ class FileLocation(object):
         """
 
         with disk_lock:
+            check_xbox_access()
             mtime = self.mtime(slotname)
 
             if mtime is None:
@@ -328,6 +341,8 @@ class FileLocation(object):
         """
 
         with disk_lock:
+            if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+                renpy.__main__.xbox_check_save_access()
             filename = self.filename(slotname)
 
             with zipfile.ZipFile(filename, "r") as zf:
@@ -346,6 +361,8 @@ class FileLocation(object):
         """
 
         with disk_lock:
+            if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+                renpy.__main__.xbox_check_save_access()
             filename = self.filename(slotname)
             if os.path.exists(filename):
                 os.unlink(filename)
@@ -359,6 +376,7 @@ class FileLocation(object):
         """
 
         with disk_lock:
+            check_xbox_access()
             old = self.filename(old)
             new = self.filename(new)
 
@@ -385,7 +403,10 @@ class FileLocation(object):
             if not os.path.exists(old):
                 return
 
-            shutil.copyfile(old, new)
+            if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+                renpy.__main__._copy_save_file(old, new)
+            else:
+                shutil.copyfile(old, new)
             renpy.util.expose_file(new)
 
             self.sync()
@@ -417,29 +438,30 @@ class FileLocation(object):
         with disk_lock:
             if not self.active:
                 return
+            if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+                renpy.__main__.xbox_check_save_write(self.persistent, len(data))
 
             fn = self.persistent
             fn_tmp = fn + tmp
             fn_new = fn + ".new"
 
-            pause_syncfs()
+            with SyncfsLock():
+                with open(fn_tmp, "wb") as f:
+                    f.write(data)
 
-            with open(fn_tmp, "wb") as f:
-                f.write(data)
+                safe_rename(fn_tmp, fn_new)
+                safe_rename(fn_new, fn)
 
-            safe_rename(fn_tmp, fn_new)
-            safe_rename(fn_new, fn)
+                # Prevent persistent from unpickle just after save
+                self.persistent_mtime = os.path.getmtime(fn)
 
-            # Prevent persistent from unpickle just after save
-            self.persistent_mtime = os.path.getmtime(fn)
-
-            renpy.util.expose_file(fn)
-
-            resume_syncfs()
+                renpy.util.expose_file(fn)
 
     def unlink_persistent(self):
         if not self.active:
             return
+        if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+            renpy.__main__.xbox_check_save_access()
 
         try:
             os.unlink(self.persistent)
@@ -468,6 +490,8 @@ class MultiLocation(object):
         self.locations = []
 
     def active_locations(self):
+        if os.environ.get("RENPY_PLATFORM", "").startswith("xbox") and not renpy.__main__.xbox_save_access_ready():
+            return []
         return [i for i in self.locations if i.active]
 
     def newest(self, slotname):
@@ -508,6 +532,7 @@ class MultiLocation(object):
     def save(self, slotname, record):
         if not renpy.config.save:
             return
+        check_xbox_access()
 
         saved = False
 
@@ -584,6 +609,7 @@ class MultiLocation(object):
     def unlink(self, slotname):
         if not renpy.config.save:
             return
+        check_xbox_access()
 
         with SyncfsLock():
             for l in self.active_locations():
@@ -592,6 +618,7 @@ class MultiLocation(object):
     def rename(self, old, new):
         if not renpy.config.save:
             return
+        check_xbox_access()
 
         with SyncfsLock():
             for l in self.active_locations():
@@ -600,6 +627,7 @@ class MultiLocation(object):
     def copy(self, old, new):
         if not renpy.config.save:
             return
+        check_xbox_access()
 
         with SyncfsLock():
             for l in self.active_locations():
@@ -614,11 +642,17 @@ class MultiLocation(object):
         return rv
 
     def save_persistent(self, data):
+        if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+            renpy.__main__.xbox_check_save_access()
         with SyncfsLock():
-            for l in reversed(self.active_locations()):
+            locations = self.active_locations()
+            if os.environ.get("RENPY_PLATFORM", "").startswith("xbox") and not locations:
+                raise OSError("No writable Xbox save location.")
+            for l in reversed(locations):
                 l.save_persistent(data)
 
     def unlink_persistent(self):
+        check_xbox_access()
         with SyncfsLock():
             for l in self.active_locations():
                 l.unlink_persistent()
@@ -651,10 +685,6 @@ scan_thread_condition = threading.Condition()
 
 
 def run_scan_thread():
-    global quit_scan_thread
-
-    quit_scan_thread = False
-
     while not quit_scan_thread:
         try:
             renpy.loadsave.location.scan()
@@ -662,11 +692,13 @@ def run_scan_thread():
             pass
 
         with scan_thread_condition:
-            scan_thread_condition.wait(5.0)
+            if not quit_scan_thread:
+                scan_thread_condition.wait(5.0)
 
 
 def quit():
     global quit_scan_thread
+    global scan_thread
 
     with scan_thread_condition:
         quit_scan_thread = True
@@ -674,6 +706,7 @@ def quit():
 
     if scan_thread is not None:
         scan_thread.join()
+        scan_thread = None
 
 
 def init():
@@ -682,6 +715,11 @@ def init():
 
     quit()
     quit_scan_thread = False
+
+    xbox = os.environ.get("RENPY_PLATFORM", "").startswith("xbox")
+    if xbox:
+        check_xbox_access()
+        renpy.config.savedir = renpy.__main__.path_to_saves(renpy.config.gamedir)
 
     location = MultiLocation()
 
@@ -699,14 +737,14 @@ def init():
 
     # 2. Game-local savedir. Skipped on Xbox: the install dir is read-only
     # in packages, and loose deploys allow writes but fail renames.
-    xbox = os.environ.get("RENPY_PLATFORM", "").startswith("xbox")
     if (not renpy.mobile) and (not renpy.macapp) and (not xbox):
         path = os.path.join(renpy.config.gamedir, "saves")
         location_add(path)
 
     # 3. Extra savedirs.
-    for i in renpy.config.extra_savedirs:
-        location_add(i)
+    if not xbox:
+        for i in renpy.config.extra_savedirs:
+            location_add(i)
 
     # Scan the location once.
     location.scan()
