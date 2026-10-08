@@ -33,6 +33,7 @@ from renpy.compat import PY2, basestring, bchr, bord, chr, open, pystr, range, r
 import math
 import os
 import sys
+import threading
 import time
 import collections
 
@@ -53,6 +54,10 @@ def _dbg(msg):
         sys.stdout.flush()
     except Exception:
         pass
+
+
+def _on_main_thread():
+    return threading.current_thread() is threading.main_thread()
 
 
 def _clear_target(renderer, w, h):
@@ -85,7 +90,7 @@ class TextureCache:
                 return tex
             # Stale — destroy and re-upload
             tex.destroy()
-            del self.cache[sid]
+            self.cache.pop(sid, None)
         return None
 
     _upload_log_count = 0
@@ -149,17 +154,23 @@ class TextureCache:
         if not self.upload_queue:
             return False
         surf = self.upload_queue.pop(0)
-        self.upload(surf)
+        if self.get(surf) is None:
+            self.upload(surf)
         return True
 
     def invalidate(self, surf):
         """Mark a surface as mutated — its cached texture is stale."""
         sid = id(surf)
         self.generations[sid] = self.generations.get(sid, 0) + 1
-        entry = self.cache.get(sid)
+
+        # Off the main thread, the generation bump is enough: get() destroys
+        # the stale texture on the main thread.
+        if not _on_main_thread():
+            return
+
+        entry = self.cache.pop(sid, None)
         if entry is not None:
             entry[0].destroy()
-            del self.cache[sid]
 
     def clear(self):
         """Destroy all cached textures."""
@@ -403,6 +414,13 @@ class SDLRendererDraw:
     def load_texture(self, surf, transient=False, properties=None):
         """Upload a surface to a GPU texture. Returns the surface for caching."""
         if self.texture_cache is None:
+            return surf
+
+        # The image preload thread and decode pool call this too. SDL_Renderer
+        # is single-threaded (and on Xbox the D3D12 queue may be suspended for
+        # PLM), so only the main thread touches the GPU. Drawing uploads what
+        # it needs itself (_get_texture), so skipping here loses nothing.
+        if not _on_main_thread():
             return surf
 
         tex = self.texture_cache.get(surf)

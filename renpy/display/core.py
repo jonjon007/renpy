@@ -1950,6 +1950,9 @@ class Interface:
         Handles the SDL2 suspend process.
         """
 
+        if ev.type == pygame.APP_DIDENTERBACKGROUND and os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
+            return self.xbox_suspend()
+
         if ev.type != pygame.APP_WILLENTERBACKGROUND:
             return False
 
@@ -2023,6 +2026,63 @@ class Interface:
 
         # Reset the display so we get the GL context back.
         self.display_reset = True
+        self.restart_interaction = True
+
+        return True
+
+    def xbox_suspend(self):
+        """
+        Handles Xbox GDK Process Lifetime Management suspend. SDL's PLM
+        callback blocks after sending APP_DIDENTERBACKGROUND until
+        suspend_complete() is called; if that doesn't happen before the
+        suspend deadline, the OS terminates the title. The D3D12 queue must
+        be suspended (SuspendX) from this thread, which is the one rendering.
+        """
+
+        import _xbox
+
+        start = time.time()
+
+        renpy.audio.audio.pause_all()
+
+        pygame.time.set_timer(PERIODIC, 0)
+        pygame.time.set_timer(REDRAW, 0)
+        pygame.time.set_timer(TIMEEVENT, 0)
+
+        # Quick Resume preserves process memory, so only persistent data
+        # needs flushing in case the suspended title is later terminated.
+        try:
+            renpy.persistent.update(True)
+            renpy.persistent.save_on_quit_MP()
+        except Exception:
+            import traceback
+
+            traceback.print_exc()
+
+        suspended = _xbox.suspend_renderer()
+
+        print("PLM: suspending (save took %.3fs, renderer suspended=%s)." % (time.time() - start, suspended))
+
+        _xbox.suspend_complete()
+
+        while True:
+            ev = pygame.event.wait()
+
+            if ev.type in (pygame.APP_TERMINATING, pygame.QUIT):
+                sys.exit(0)
+
+            if ev.type == pygame.APP_WILLENTERFOREGROUND:
+                break
+
+        if suspended:
+            _xbox.resume_renderer()
+
+        print("PLM: resumed.")
+
+        pygame.time.set_timer(PERIODIC, PERIODIC_INTERVAL)
+
+        renpy.audio.audio.unpause_all()
+
         self.restart_interaction = True
 
         return True
