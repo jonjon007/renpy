@@ -73,6 +73,9 @@ cache/
 /web2
 /web3
 
+# The xbox DLC, copied from xbox-build\dist\xbox when building the SDK.
+/xbox
+
 # Docs.
 /sphinx/source/inc
 /sphinx/source/thequestion.rst

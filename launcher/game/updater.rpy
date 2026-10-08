@@ -38,12 +38,20 @@ init python:
 
         return name in updater.get_installed_packages()
 
-    def add_dlc(name, restart=False):
+    def add_dlc(name, restart=False, url=None):
         """
         Adds the DLC package, if it doesn't already exist.
 
+        `url`
+            If given, the updates.json URL to install from (for example, a
+            file: URL to a downloaded DLC). Otherwise, the DLC is downloaded
+            from the update server for this version of Ren'Py.
+
         Returns True if the DLC is installed, False otherwise.
         """
+
+        if url is not None:
+            return renpy.invoke_in_new_context(updater.update, url, add=[name], public_key=PUBLIC_KEY, simulate=UPDATE_SIMULATE, restart=restart, confirm=False)
 
         dlc_url = "http://update.renpy.org/{}/updates.json".format(".".join(str(i) for i in version_tuple[:-1]))
 

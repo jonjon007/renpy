@@ -297,6 +297,8 @@ init python:
     build.classify_renpy("web/game.zip", None)
     build.classify_renpy("web/**", "web")
 
+    build.classify_renpy("xbox/**", "xbox")
+
     build.classify_renpy("**.old", None)
     build.classify_renpy("**.new", None)
     build.classify_renpy("**.bak", None)
@@ -440,6 +442,7 @@ init python:
     build.package("rapt", "zip", "rapt", dlc=True)
     build.package("renios", "zip", "renios", dlc=True)
     build.package("web", "zip", "web", dlc=True)
+    build.package("xbox", "zip", "xbox", dlc=True)
 
 # The identifier for the SDK.
 define build.mac_info_plist["CFBundleIdentifier"] = "org.renpy.sdk"

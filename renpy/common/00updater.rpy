@@ -42,11 +42,37 @@ init -1500 python in updater:
     import codecs
     import io
 
+    def local_url_path(url):
+        """
+        Returns the local path named by a file: URL, or None if `url` isn't
+        one.
+        """
+
+        import renpy.update.download
+        return renpy.update.download.local_path(url)
+
     def urlopen(url):
+        path = local_url_path(url)
+
+        if path is not None:
+            with open(path, "rb") as f:
+                return io.BytesIO(f.read())
+
         import requests
         return io.BytesIO(requests.get(url, proxies=renpy.exports.proxies, timeout=15).content)
 
     def urlretrieve(url, fn):
+        path = local_url_path(url)
+
+        if path is not None:
+            with open(path, "rb") as f:
+                data = f.read()
+
+            with open(fn, "wb") as f:
+                f.write(data)
+
+            return
+
         import requests
 
         data = requests.get(url, proxies=renpy.exports.proxies, timeout=15).content
@@ -417,15 +443,19 @@ init -1500 python in updater:
             url = urlparse.urljoin(self.url, self.updates[module]["rpu_url"])
 
             try:
-                resp = requests.get(url, proxies=renpy.exports.proxies, timeout=15)
-                resp.raise_for_status()
+                content = urlopen(url).read() if local_url_path(url) is not None else None
+
+                if content is None:
+                    resp = requests.get(url, proxies=renpy.exports.proxies, timeout=15)
+                    resp.raise_for_status()
+                    content = resp.content
             except Exception as e:
                 raise UpdateError(__("Could not download file list: ") + str(e))
 
-            if hashlib.sha256(resp.content).hexdigest() != self.updates[module]["rpu_digest"]:
+            if hashlib.sha256(content).hexdigest() != self.updates[module]["rpu_digest"]:
                 raise UpdateError(__("File list digest does not match."))
 
-            data = zlib.decompress(resp.content)
+            data = zlib.decompress(content)
 
             from renpy.update.common import FileList
 

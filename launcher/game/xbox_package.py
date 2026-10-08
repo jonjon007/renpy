@@ -192,6 +192,180 @@ def find_dlc(sdk, xbox_build=None):
     return None, False
 
 
+# The name of the update index in an xbox DLC download (the updater's
+# updates.json, with updates.ecdsa and rpu\ next to it).
+UPDATES_JSON = "updates.json"
+
+
+def is_sdk(sdk):
+    """
+    Returns true if `sdk` is an installed Ren'Py SDK (one that the updater
+    can add DLC to), rather than a source checkout.
+    """
+
+    return os.path.isfile(os.path.join(sdk, "update", "current.json"))
+
+
+def find_dlc_source(path, workdir):
+    """
+    Finds the update directory of a downloaded xbox DLC. `path` may be the
+    DLC's .zip (extracted into `workdir`, which is emptied first), its
+    updates.json, or a directory containing updates.json directly or in a
+    single subdirectory. Returns the directory containing updates.json.
+    Raises XboxBuildError if it can't be found.
+    """
+
+    path = os.path.abspath(path)
+
+    if os.path.isfile(path) and path.lower().endswith(".zip"):
+        import zipfile
+
+        if os.path.exists(workdir):
+            shutil.rmtree(workdir)
+
+        os.makedirs(workdir)
+
+        try:
+            with zipfile.ZipFile(path) as zf:
+                zf.extractall(workdir)
+        except (zipfile.BadZipFile, OSError) as e:
+            raise XboxBuildError("Couldn't extract {}: {}".format(path, e))
+
+        path = workdir
+
+    elif os.path.isfile(path):
+        if os.path.basename(path).lower() != UPDATES_JSON:
+            raise XboxBuildError("{} isn't an xbox DLC download (expected a .zip or {}).".format(path, UPDATES_JSON))
+
+        return os.path.dirname(path)
+
+    if not os.path.isdir(path):
+        raise XboxBuildError("{} doesn't exist.".format(path))
+
+    if os.path.isfile(os.path.join(path, UPDATES_JSON)):
+        return path
+
+    subdirs = [ os.path.join(path, i) for i in os.listdir(path) if os.path.isfile(os.path.join(path, i, UPDATES_JSON)) ]
+
+    if len(subdirs) == 1:
+        return subdirs[0]
+
+    raise XboxBuildError("{} doesn't contain an xbox DLC ({} not found).".format(path, UPDATES_JSON))
+
+
+def check_dlc_source(source, renpy_version=None):
+    """
+    Checks the xbox DLC update directory `source` (as returned by
+    find_dlc_source). If `renpy_version` is given, the DLC must have been
+    built for that version of Ren'Py. Returns (problems, pretty_version).
+    The signature (updates.ecdsa) is verified by the updater itself.
+    """
+
+    try:
+        with io.open(os.path.join(source, UPDATES_JSON), "r", encoding="utf-8") as f:
+            updates = json.load(f)
+    except (OSError, ValueError) as e:
+        return [ "Couldn't read {}: {}".format(UPDATES_JSON, e) ], None
+
+    entry = updates.get(DLC_DIR) if isinstance(updates, dict) else None
+
+    if not isinstance(entry, dict):
+        return [ "This download doesn't contain the xbox DLC." ], None
+
+    rv = [ ]
+
+    if not os.path.isfile(os.path.join(source, "updates.ecdsa")):
+        rv.append("The download is missing its signature (updates.ecdsa).")
+
+    rpu = entry.get("rpu_url")
+
+    if not rpu:
+        rv.append("The xbox DLC entry has no rpu_url.")
+    elif not os.path.isfile(os.path.join(source, *rpu.split("/"))):
+        rv.append("The download is missing {}.".format(rpu))
+
+    if renpy_version is not None:
+        built = base_version(entry.get("renpy_version", ""))
+
+        if built != base_version(renpy_version):
+            rv.append("This xbox DLC is for Ren'Py {}, but this is Ren'Py {}. Download the xbox DLC released with this SDK.".format(
+                built or "(unknown)", base_version(renpy_version)))
+
+    return rv, entry.get("pretty_version")
+
+
+def source_url(source):
+    """
+    Returns the file: URL of the updates.json in the DLC update directory
+    `source`, for the updater.
+    """
+
+    import pathlib
+    return pathlib.Path(os.path.abspath(source), UPDATES_JSON).as_uri()
+
+
+def make_dlc_bundle(update_dir, out_zip, name=DLC_DIR, folder=None):
+    """
+    Writes the release download for DLC `name` to `out_zip`, from the
+    distribute output `update_dir` (updates.json, updates.ecdsa, rpu\\). Only
+    the rpu blocks containing the DLC's data are included. updates.json is
+    copied unchanged, so its signature stays valid. Files are placed in
+    `folder` inside the zip (default: the zip's base name). Returns the
+    number of block files included.
+    """
+
+    import zipfile
+    import zlib
+
+    with io.open(os.path.join(update_dir, UPDATES_JSON), "r", encoding="utf-8") as f:
+        entry = json.load(f).get(name)
+
+    if not entry or not entry.get("rpu_url"):
+        raise XboxBuildError("{} has no rpu entry for {}.".format(os.path.join(update_dir, UPDATES_JSON), name))
+
+    rpu_url = entry["rpu_url"]
+    rpu_dir = os.path.dirname(rpu_url)
+
+    with open(os.path.join(update_dir, *rpu_url.split("/")), "rb") as f:
+        filelist = json.loads(zlib.decompress(f.read()).decode("utf-8"))
+
+    needed = set(seg["hash"] for i in filelist["files"] for seg in i["segments"])
+    blocks = [ ]
+    covered = set()
+
+    for b in filelist["blocks"]:
+        hashes = set(seg["hash"] for seg in b["segments"])
+
+        if hashes & needed:
+            blocks.append(b["name"])
+            covered |= hashes
+
+    missing = needed - covered
+
+    if missing:
+        raise XboxBuildError("{} segments of {} aren't in any block.".format(len(missing), name))
+
+    if folder is None:
+        folder = os.path.splitext(os.path.basename(out_zip))[0]
+
+    files = [ UPDATES_JSON, "updates.ecdsa", rpu_url ] + [ rpu_dir + "/" + i for i in blocks ]
+
+    tmp = out_zip + ".tmp"
+
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
+        for rel in files:
+            path = os.path.join(update_dir, *rel.split("/"))
+
+            if not os.path.isfile(path):
+                raise XboxBuildError("{} is missing.".format(path))
+
+            compress = zipfile.ZIP_DEFLATED if rel.endswith(".json") else zipfile.ZIP_STORED
+            zf.write(path, folder + "/" + rel, compress_type=compress)
+
+    os.replace(tmp, out_zip)
+    return len(blocks)
+
+
 class XboxBuildError(Exception):
     """
     A build step failed. The message is meant to be shown to the user.
@@ -793,6 +967,10 @@ def _main(argv=None):
     sp.add_argument("--config", required=True)
     sp.add_argument("--part", choices=[ "aumid", "full_name", "family_name", "publisher_id" ], default="aumid")
 
+    sp = sub.add_parser("bundle", help="Make the xbox DLC release download from a distribute output directory.")
+    sp.add_argument("--update-dir", required=True, help="The distribute output with updates.json, updates.ecdsa and rpu\\.")
+    sp.add_argument("--out", required=True, help="The .zip to write.")
+
     args = ap.parse_args(argv)
 
     try:
@@ -857,6 +1035,10 @@ def _main(argv=None):
 
         elif args.command == "id":
             print(package_identity(args.config)[args.part])
+
+        elif args.command == "bundle":
+            n = make_dlc_bundle(args.update_dir, args.out)
+            print("{} ({} blocks, {:,} bytes)".format(args.out, n, os.path.getsize(args.out)))
 
     except XboxBuildError as e:
         print("ERROR: {}".format(e), file=sys.stderr)

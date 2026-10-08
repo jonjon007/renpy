@@ -139,7 +139,12 @@ init python:
         problems = xbox_package.check_dlc(dlc, target, None if dev else renpy.version_only)
 
         if problems:
-            interface.error(_("Xbox support can't build this target:"), _("[problems!q]"), problems="\n".join(problems), label="xbox")
+            if dev or not xbox_package.is_sdk(config.renpy_base):
+                interface.error(_("Xbox support can't build this target:"), _("[problems!q]"), problems="\n".join(problems), label="xbox")
+
+            interface.yesno(_("Xbox support can't build this target. Install Xbox support from a download now?"),
+                submessage=_("[problems!q]"), problems="\n".join(problems),
+                yes=Jump("xbox_install_dlc"), no=Jump("xbox"))
 
         if not os.path.exists(xbox_config_path()):
             interface.error(_("There is no MicrosoftGame.config yet. Use Edit Game Config to create one."), label="xbox")
@@ -332,6 +337,8 @@ screen xbox_build_frame():
 
                 if dev:
                     text _("Dev mode: using xbox-build's dist\\xbox DLC.") style "l_small_text"
+                elif xbox_package.is_sdk(config.renpy_base):
+                    textbutton _("Update Xbox Support...") style "l_small_button" action Jump("xbox_install_dlc")
 
 
 label xbox_build:
@@ -343,5 +350,58 @@ label xbox_build_install:
     jump xbox
 
 label xbox_install_dlc:
-    $ interface.info(_("Installing Xbox support from the launcher isn't available yet. Extract the xbox DLC into the Ren'Py SDK's xbox folder."))
+    $ xbox_install_dlc()
     jump xbox
+
+init python:
+
+    def xbox_install_dlc():
+        """
+        Installs (or updates) the xbox DLC from a downloaded .zip, folder or
+        updates.json, using the updater so the DLC is tracked like the other
+        Ren'Py DLC. The download's signature must match this SDK's update key.
+        """
+
+        if not xbox_package.is_sdk(config.renpy_base):
+            interface.error(_("Xbox support can only be installed into a Ren'Py SDK. In an engine checkout, build xbox-build's dist\\xbox instead (see REBUILDING.md)."), label="xbox")
+
+        try:
+            import renpy.tfd as tfd
+        except ImportError:
+            tfd = None
+
+        if tfd is None:
+            interface.error(_("File dialogs are not available on this platform."), label="xbox")
+
+        default = os.path.join(os.path.expanduser("~"), "Downloads", "")
+        path = tfd.openFileDialog(__("Select the Xbox support download (.zip or updates.json)"), default, [ "*.zip", "updates.json" ], __("Xbox support download"))
+
+        if not path:
+            return
+
+        path = renpy.fsdecode(path)
+        workdir = os.path.join(config.renpy_base, "tmp", "xbox-dlc")
+
+        try:
+            try:
+                source = xbox_background(_("Reading the Xbox support download..."),
+                    lambda : xbox_package.find_dlc_source(path, workdir))
+            except xbox_package.XboxBuildError as e:
+                interface.error(_("[message!q]"), message=str(e), label="xbox")
+
+            problems, pretty = xbox_package.check_dlc_source(source, renpy.version_only)
+
+            if problems:
+                interface.error(_("This Xbox support download can't be installed:"), _("[problems!q]"), problems="\n".join(problems), label="xbox")
+
+            add_dlc("xbox", restart=False, url=xbox_package.source_url(source))
+
+        finally:
+            xbox_rmtree(workdir)
+
+        dlc = xbox_package.dlc_path(config.renpy_base)
+
+        if xbox_package.check_dlc(dlc, xbox_target(), renpy.version_only):
+            interface.error(_("Xbox support wasn't installed. The updater's log is in the SDK's update\\log.txt."), label="xbox")
+
+        interface.info(_("Xbox support [version!q] is installed."), version=pretty or "")

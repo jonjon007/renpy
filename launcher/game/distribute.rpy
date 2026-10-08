@@ -101,6 +101,7 @@ fix_dlc("steam", "lib/py2-linux-x86_64/libsteam_api.so")
 fix_dlc("web", "web")
 fix_dlc("rapt", "rapt")
 fix_dlc("renios", "renios")
+fix_dlc("xbox", "xbox/dlc.json")
 """)
 
     match_cache = { }

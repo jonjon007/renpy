@@ -27,6 +27,29 @@ import renpy
 import requests
 import re
 import os
+import shutil
+
+
+def local_path(url):
+    """
+    If `url` is a file: URL, returns the local path it names. Otherwise,
+    returns None. This lets updates and DLC be installed from a local
+    directory.
+    """
+
+    if not url.startswith("file:"):
+        return None
+
+    import urllib.parse
+    import urllib.request
+
+    parsed = urllib.parse.urlparse(url)
+    path = urllib.request.url2pathname(parsed.path)
+
+    if parsed.netloc and parsed.netloc != "localhost":
+        path = "\\\\" + parsed.netloc + path if os.name == "nt" else "//" + parsed.netloc + path
+
+    return path
 
 
 def byte_ranges(ranges):
@@ -193,6 +216,18 @@ def download(url, ranges, destination, progress_callback=None):
         and the total number of bytes to download. (This is not perfect, as
         headers will add overhead.)
     """
+
+    path = local_path(url)
+
+    if path is not None:
+        total_size = sum(i[1] for i in ranges)
+
+        shutil.copyfile(path, destination)
+
+        if progress_callback is not None:
+            progress_callback(total_size, total_size)
+
+        return
 
     try:
         if download_ranges(url, ranges, destination, progress_callback=progress_callback):
