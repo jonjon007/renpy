@@ -462,6 +462,31 @@ def precompile(layout, incremental=False):
     return rv
 
 
+def finish_layout(layout, dlc, target, config, version_dict, incremental=False):
+    """
+    Turns a layout holding renpy\\ and game\\ (from the Distributor or
+    stage_renpy_source/stage_game) into a loose Xbox layout: adds the DLC
+    runtime, vc_version.py, the MicrosoftGame.config and its images, and
+    .pyc files.
+
+    `version_dict`
+        renpy.version_dict, or a function returning it (only called if the
+        layout has no vc_version.py).
+
+    Returns a list of warnings about the config.
+    """
+
+    stage_runtime(dlc, target, layout, incremental)
+
+    if not os.path.exists(os.path.join(layout, "renpy", "vc_version.py")):
+        write_vc_version(layout, version_dict() if callable(version_dict) else version_dict)
+
+    rv = stage_gameconfig(config, layout, target)
+    precompile(layout, incremental)
+
+    return rv
+
+
 ################################################################################
 # Package identity
 
@@ -683,6 +708,31 @@ def launch(aumid, log=None, console=None):
         raise XboxBuildError("xbapp launch {} failed. See the log for details.".format(aumid))
 
 
+def find_devkit(timeout=15):
+    """
+    Returns the name or address of the default devkit (set with xbconnect),
+    or None if there isn't one or it doesn't answer within `timeout` seconds.
+    """
+
+    exe = xbox_config.find_gdk_tool("xbconnect.exe")
+
+    if exe is None:
+        return None
+
+    try:
+        p = subprocess.run([ exe, "/B" ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    lines = p.stdout.decode("utf-8", "replace").strip().splitlines()
+
+    if p.returncode or not lines:
+        return None
+
+    return lines[-1].strip() or None
+
+
 def full_validation(config, dlc, target, workdir, log=None):
     """
     Stages the DLC runtime and `config` (with its images) into
@@ -770,25 +820,19 @@ def _main(argv=None):
             n = stage_game(game, args.layout, args.incremental)
             print("  game\\: {} files from {}".format(n, game))
 
-            n = stage_runtime(args.dlc, args.target, args.layout, args.incremental)
-            print("  runtime: {} files".format(n))
+            for w in finish_layout(args.layout, args.dlc, args.target, config,
+                    lambda : git_version_dict(args.renpy), args.incremental):
+                print("  WARN: " + w)
+
+            print("  runtime from {}".format(runtime_path(args.dlc, args.target)))
+            print("  MicrosoftGame.config staged from {}".format(config))
+
+            if not can_precompile():
+                print("  .pyc files not compiled (needs Python 3.12; the console compiles them in memory)")
 
             if args.bootstrap:
                 shutil.copyfile(args.bootstrap, os.path.join(args.layout, "renpy.py"))
                 print("  renpy.py replaced with {}".format(args.bootstrap))
-
-            if not os.path.exists(os.path.join(args.layout, "renpy", "vc_version.py")):
-                write_vc_version(args.layout, git_version_dict(args.renpy))
-                print("  renpy\\vc_version.py written")
-
-            for w in stage_gameconfig(config, args.layout, args.target):
-                print("  WARN: " + w)
-
-            print("  MicrosoftGame.config staged from {}".format(config))
-
-            n = precompile(args.layout, args.incremental)
-            if can_precompile():
-                print("  {} .pyc files compiled".format(n))
 
         elif args.command == "pack":
             gdk = find_gdk()

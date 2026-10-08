@@ -21,7 +21,8 @@
 
 # This file contains the launcher's Xbox (Microsoft GDK) support: creating,
 # editing and validating a project's xbox\MicrosoftGame.config. The logic
-# that doesn't need Ren'Py lives in xbox_config.py.
+# that doesn't need Ren'Py lives in xbox_config.py; building and deploying
+# is in xbox_build.rpy and xbox_package.py.
 
 # An explicit path to GameConfigEditor.exe (or its folder), or None to auto-detect.
 default persistent.xbox_gameconfig_editor = None
@@ -413,18 +414,7 @@ screen xbox():
                     add SEPARATOR2
                     add HALF_SPACER
 
-                    frame:
-                        style "l_indent"
-                        has vbox
-
-                        text _("Build & Deploy:")
-
-                        add HALF_SPACER
-
-                        frame style "l_indent":
-                            has vbox
-
-                            text _("Coming later. For now, run xbox-build\\package_xbox.bat with GAMECONFIG set to this config.") style "l_small_text"
+                    use xbox_build_frame
 
     textbutton _("Return") action Jump("front_page") style "l_left_button"
 
@@ -521,6 +511,8 @@ label xbox:
     if not renpy.windows:
         jump front_page
 
+    $ project.current.update_dump(only_existing=True)
+
     call screen xbox
     jump front_page
 
@@ -585,7 +577,7 @@ label xbox_full_validate:
     python hide:
         path = xbox_config_path()
         dlc, dev = xbox_dlc()
-        target = persistent.xbox_target
+        target = xbox_target()
 
         if not os.path.exists(path):
             interface.error(_("There is no MicrosoftGame.config yet. Use Edit Game Config to create one."), label="xbox")
