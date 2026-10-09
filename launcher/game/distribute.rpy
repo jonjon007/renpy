@@ -1629,7 +1629,8 @@ fix_dlc("xbox", "xbox/dlc.json")
             elif format == "null":
                 pkg = NullPackage()
             elif format == "zip" or format == "app-zip" or format == "bare-zip":
-                if self.build['renpy']:
+                # Ren'Py's own build uses Info-ZIP when it's available (it's not on Windows).
+                if self.build['renpy'] and shutil.which("zip"):
                     pkg = ExternalZipPackage(path)
                 else:
                     pkg = ZipPackage(path)
