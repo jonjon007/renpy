@@ -95,6 +95,87 @@ def force_even_timestamps():
             if st.st_mtime % 2 != 0:
                 os.utime(fn, (st.st_atime, st.st_mtime + 1))
 
+def find_7zip():
+    """
+    Returns the paths to 7z and 7z.sfx. On Windows, these come from the 7-Zip
+    install if they aren't on the PATH or in the Ren'Py root.
+    """
+
+    sevenzip = shutil.which("7z")
+    sfx = os.path.join(ROOT, "7z.sfx")
+
+    if os.name == "nt":
+        install = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "7-Zip")
+
+        if sevenzip is None and os.path.exists(os.path.join(install, "7z.exe")):
+            sevenzip = os.path.join(install, "7z.exe")
+
+        if not os.path.exists(sfx):
+            sfx = os.path.join(install, "7z.sfx")
+
+    if sevenzip is None or not os.path.exists(sfx):
+        raise Exception("Couldn't find 7z and 7z.sfx. Install 7-Zip.")
+
+    return sevenzip, sfx
+
+
+def prepare_xbox_dlc(dlc, version):
+    """
+    Copies the xbox DLC (make_xbox_dlc.ps1 output) into xbox/, where the
+    launcher's build classifies it into the xbox package, after checking it
+    was built for this version of Ren'Py.
+    """
+
+    sys.path.insert(0, os.path.join(ROOT, "launcher", "game"))
+    import xbox_package
+
+    problems = [ ]
+
+    for target in sorted(xbox_package.xbox_config.GDK_PLATFORMS):
+        problems.extend(xbox_package.check_dlc(dlc, target, version))
+
+    if problems:
+        raise Exception("The xbox DLC in {} can't be used:\n  {}".format(dlc, "\n  ".join(problems)))
+
+    dest = os.path.join(ROOT, xbox_package.DLC_DIR)
+
+    if os.path.exists(dest):
+        shutil.rmtree(dest)
+
+    shutil.copytree(dlc, dest)
+
+
+def finish_xbox(destination, version):
+    """
+    Makes the xbox DLC download (the signed update files the launcher's
+    "Install Xbox support" installs from) and SHA256SUMS. `destination` is
+    the current directory.
+    """
+
+    import hashlib
+    import xbox_package
+
+    xbox_package.make_dlc_bundle(".", "renpy-{}-xbox-dlc.zip".format(version))
+
+    names = [
+        "renpy-{}-sdk.zip".format(version),
+        "renpy-{}-sdk.7z.exe".format(version),
+        "renpy-{}-xbox-dlc.zip".format(version),
+        ]
+
+    with open("SHA256SUMS", "w", newline="\n") as f:
+        for fn in names:
+            h = hashlib.sha256()
+
+            with open(fn, "rb") as data:
+                for chunk in iter(lambda: data.read(1024 * 1024), b""):
+                    h.update(chunk)
+
+            f.write("{} *{}\n".format(h.hexdigest(), fn))
+
+    print("Wrote {} and SHA256SUMS in {}.".format(names[-1], destination))
+
+
 def main():
 
     start = time.time()
@@ -113,8 +194,14 @@ def main():
     ap.add_argument("--append-version", action="store_true")
     ap.add_argument("--nightly", action="store_true")
     ap.add_argument("--print-version", action="store_true")
+    ap.add_argument("--xbox", action="store", metavar="DLC", default=None,
+        help="Build the Windows-only SDK and the xbox DLC from the given make_xbox_dlc.ps1 output, signed with update.pem.")
 
     args = ap.parse_args()
+
+    if args.xbox:
+        args.xbox = os.path.abspath(args.xbox)
+        args.sign = False
 
     link_directory("rapt")
     link_directory("renios")
@@ -126,7 +213,7 @@ def main():
     if args.link_directories or args.vc_version_only:
         return
 
-    if not os.path.abspath(sys.executable).startswith(ROOT + "/lib"):
+    if not os.path.abspath(sys.executable).startswith(os.path.join(ROOT, "lib")):
         raise Exception("Distribute must be run with the python in lib/.")
 
     if args.sign:
@@ -184,10 +271,18 @@ def main():
 
     print("Version {} ({})".format(args.version, full_version))
 
-    if sys.version_info[0] >= 3:
-        renpy_sh = "./renpy3.sh"
+    if args.xbox:
+        if not os.path.exists(os.path.join(ROOT, "update.pem")):
+            raise Exception("update.pem (the update signing key) isn't in the Ren'Py root.")
+
+        prepare_xbox_dlc(args.xbox, full_version)
+
+    if args.xbox:
+        renpy_sh = [ sys.executable, os.path.join(ROOT, "renpy.py") ]
+    elif sys.version_info[0] >= 3:
+        renpy_sh = [ "./renpy3.sh" ]
     else:
-        renpy_sh = "./renpy2.sh"
+        renpy_sh = [ "./renpy2.sh" ]
 
     force_even_timestamps()
 
@@ -198,10 +293,10 @@ def main():
     if not args.fast:
         for i in [ 'tutorial', 'launcher', 'the_question' ]:
             print("Compiling", i)
-            subprocess.check_call([renpy_sh, i, "compile" ])
+            subprocess.check_call(renpy_sh + [ i, "compile" ])
 
     # Kick off the rapt build.
-    if not args.fast:
+    if not args.fast and not args.xbox:
 
         print("Cleaning RAPT.")
 
@@ -221,12 +316,29 @@ def main():
     if not os.path.exists(destination):
         os.makedirs(destination)
 
-    zip_rapt_symbols(destination)
+    if not args.xbox:
+        zip_rapt_symbols(destination)
 
-    if args.fast:
+    if args.xbox:
 
-        cmd = [
-            renpy_sh,
+        # The Windows-only SDK, and the xbox DLC.
+        cmd = renpy_sh + [
+            "launcher",
+            "distribute",
+            "launcher",
+            "--package",
+            "sdk",
+            "--package",
+            "xbox",
+            "--format",
+            "zip",
+            "--destination",
+            destination,
+            ]
+
+    elif args.fast:
+
+        cmd = renpy_sh + [
             "launcher",
             "distribute",
             "launcher",
@@ -238,8 +350,7 @@ def main():
             ]
 
     else:
-        cmd = [
-            renpy_sh,
+        cmd = renpy_sh + [
             "launcher",
             "distribute",
             "launcher",
@@ -256,8 +367,9 @@ def main():
     print()
     subprocess.check_call(cmd)
 
-    # Sign the update.
-    if not args.fast:
+    # Sign the update. (The xbox build's updates.json is only signed with
+    # update.pem, by the launcher.)
+    if not args.fast and not args.xbox:
         subprocess.check_call([
             "uv", "run",
             "scripts/sign_update.py",
@@ -272,7 +384,9 @@ def main():
 
         # shutil.copy("renpy-ppc.zip", os.path.join(destination, "renpy-ppc.zip"))
 
-        with open("7z.sfx", "rb") as f:
+        sevenzip, sfx_fn = find_7zip()
+
+        with open(sfx_fn, "rb") as f:
             sfx = f.read()
 
         os.chdir(destination)
@@ -280,14 +394,20 @@ def main():
         if os.path.exists(sdk):
             shutil.rmtree(sdk)
 
-        subprocess.check_call([ "unzip", "-q", sdk + ".zip" ])
+        if args.xbox:
+            import zipfile
+
+            with zipfile.ZipFile(sdk + ".zip") as zf:
+                zf.extractall(".")
+        else:
+            subprocess.check_call([ "unzip", "-q", sdk + ".zip" ])
 
         if os.path.exists(sdk + ".7z"):
             os.unlink(sdk + ".7z")
 
         sys.stdout.write("Creating -sdk.7z")
 
-        p = subprocess.Popen([ "7z", "a", sdk + ".7z", sdk], stdout=subprocess.PIPE)
+        p = subprocess.Popen([ sevenzip, "a", sdk + ".7z", sdk], stdout=subprocess.PIPE)
         for i, _l in enumerate(p.stdout): # type: ignore
             if i % 10 != 0:
                 continue
@@ -307,6 +427,10 @@ def main():
 
         os.unlink(sdk + ".7z")
         shutil.rmtree(sdk)
+
+        if args.xbox:
+            print()
+            finish_xbox(destination, args.version)
 
     else:
         os.chdir(destination)
