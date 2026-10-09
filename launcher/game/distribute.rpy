@@ -702,7 +702,9 @@ fix_dlc("xbox", "xbox/dlc.json")
             self.add_python()
 
             # Build the mac app and windows exes. (Windows-only SDKs have no Mac runtime.)
-            if os.path.exists(os.path.join(config.renpy_base, py("lib/py{major}-mac-universal/renpy"))):
+            has_mac = os.path.exists(os.path.join(config.renpy_base, py("lib/py{major}-mac-universal/renpy")))
+
+            if has_mac:
                 self.add_mac_files()
 
             self.add_windows_files()
@@ -733,7 +735,7 @@ fix_dlc("xbox", "xbox/dlc.json")
                     app = self.sign_app(app, macapp)
                     fl = FileList.merge([ app, rest ])
                     self.file_lists['binary'] = fl
-                else:
+                elif has_mac:
                     raise Exception("No mac app found.")
 
             # The time of the update version.
