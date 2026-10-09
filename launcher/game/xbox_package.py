@@ -948,7 +948,10 @@ def install(xvc, log=None, console=None):
     """
 
     if _xbapp([ "install", xvc ], log, console):
-        raise XboxBuildError("xbapp install failed. Check that the devkit is connected (xbconnect) and see the log.")
+        raise XboxBuildError("xbapp install failed. Check that the devkit is connected (xbconnect) and see the log. "
+            "Streaming installs need the console to connect back to this PC: if the log says the console lost "
+            "communication with the development PC, disable extra network adapters on the same network (for "
+            "example Wi-Fi alongside Ethernet) and make sure the network profile is Private.")
 
 
 def deploy(layout, gdk, log=None, console=None):
@@ -1029,6 +1032,20 @@ def full_validation(config, dlc, target, workdir, log=None):
 
 ################################################################################
 # Command line (used by xbox-build's package_xbox.bat and quick_deploy.bat)
+
+
+def _config_file(path):
+    """
+    Accepts a MicrosoftGame.config, the folder containing it, or a project
+    folder, and returns the path of the MicrosoftGame.config.
+    """
+
+    if os.path.isdir(path):
+        for p in (os.path.join(path, xbox_config.CONFIG_NAME), xbox_config.config_path(path)):
+            if os.path.isfile(p):
+                return p
+
+    return path
 
 
 def _main(argv=None):
@@ -1125,10 +1142,10 @@ def _main(argv=None):
             deploy(args.layout, _require_gdk())
 
         elif args.command == "launch":
-            launch(package_identity(args.config)["aumid"])
+            launch(package_identity(_config_file(args.config))["aumid"])
 
         elif args.command == "id":
-            print(package_identity(args.config)[args.part])
+            print(package_identity(_config_file(args.config))[args.part])
 
         elif args.command == "bundle":
             n = make_dlc_bundle(args.update_dir, args.out)
