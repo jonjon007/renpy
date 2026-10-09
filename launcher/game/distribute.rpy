@@ -708,6 +708,7 @@ fix_dlc("xbox", "xbox/dlc.json")
                 self.add_mac_files()
 
             self.add_windows_files()
+            self.add_windows_gdk_dlls(build_packages)
 
             # Add the main.py.
             self.add_main_py()
@@ -1281,6 +1282,41 @@ fix_dlc("xbox", "xbox/dlc.json")
 
             write_exe("lib/py3-windows-x86_64/renpy.exe", self.exe, self.exe, windows)
             write_exe("lib/py3-windows-x86_64/pythonw.exe", "lib/py3-windows-x86_64/pythonw.exe", "pythonw-64.exe", windows)
+
+        def add_windows_gdk_dlls(self, build_packages):
+            """
+            If build.windows_gdk_dlls is set and a Windows package is being
+            built, adds the Microsoft GDK's PC runtime DLLs from the installed
+            GDK to that directory of the Windows distributions, replacing any
+            copies in the project.
+            """
+
+            dest = self.build.get("windows_gdk_dlls")
+
+            if not dest or self.build['renpy']:
+                return
+
+            if not any("windows" in p["file_lists"] for p in build_packages):
+                return
+
+            import xbox_package
+
+            gdk = xbox_package.find_gdk(kind="pc")
+
+            if gdk is None:
+                raise Exception("build.windows_gdk_dlls is set, but no Microsoft GDK with the PC runtime DLLs was found. Install the GDK, or set GDK_DIR to its edition directory.")
+
+            dest = dest.strip("/").replace("\\", "/")
+
+            for name, path in xbox_package.gdk_dlls(gdk, "pc"):
+                fn = dest + "/" + name
+
+                for fl in self.file_lists.values():
+                    fl[:] = [ i for i in fl if i.name.lower() != fn.lower() ]
+
+                self.add_file("windows", fn, path)
+
+            self.log.write("Added the GDK runtime DLLs from {} to {}.\n".format(gdk, dest))
 
 
         def add_main_py(self):

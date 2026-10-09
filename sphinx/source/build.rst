@@ -480,3 +480,14 @@ The following variables provide further control of the build process:
 
     Gives a version of the build used by the build process. If None, this defaults to config.version. The main use
     of this is to allow config.version to have characters that are not valid in file or directory names.
+
+.. var:: build.windows_gdk_dlls = None
+
+    If not None, a directory in the Windows distributions (for example,
+    ``"game/lib"``) that the Microsoft GDK's PC runtime DLLs
+    (xgameruntime.thunks.dll, XCurl.dll, libHttpClient.GDK.dll and
+    Microsoft.Xbox.Services.GDK.C.Thunks.dll) are copied to when building. They
+    are taken from the GDK installed on the computer doing the build (or the
+    edition given by the ``GDK_DIR`` environment variable), replacing any
+    copies in the project. This is for games that use the GDK on Windows,
+    for example through ctypes.

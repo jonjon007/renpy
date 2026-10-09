@@ -522,6 +522,11 @@ init -1500 python in build:
     # Which update formats should be built?
     update_formats = [ "rpu" ]
 
+    # A directory in Windows distributions (e.g. "game/lib") that the
+    # Microsoft GDK's PC runtime DLLs are copied to from the GDK installed on
+    # the building machine, or None to not include them.
+    windows_gdk_dlls = None
+
     # Should the gameonly update be available?
     game_only_update = False
 
@@ -626,6 +631,8 @@ init -1500 python in build:
         rv["_sdk_fonts"] = _sdk_fonts
 
         rv["update_formats"] = update_formats
+
+        rv["windows_gdk_dlls"] = windows_gdk_dlls
 
         rv["info"] = {
             "info" : info,

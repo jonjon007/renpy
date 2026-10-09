@@ -60,8 +60,6 @@ RUNTIME_REQUIRED = (
     "avutil-59.dll",
     "swresample-5.dll",
     "swscale-8.dll",
-    "libHttpClient.GDK.dll",
-    "Microsoft.Xbox.Services.GDK.C.Thunks.dll",
     "vcruntime140.dll",
     "vcruntime140_1.dll",
     "msvcp140.dll",
@@ -636,21 +634,27 @@ def precompile(layout, incremental=False):
     return rv
 
 
-def finish_layout(layout, dlc, target, config, version_dict, incremental=False):
+def finish_layout(layout, dlc, target, config, version_dict, incremental=False, gdk=None):
     """
     Turns a layout holding renpy\\ and game\\ (from the Distributor or
     stage_renpy_source/stage_game) into a loose Xbox layout: adds the DLC
-    runtime, vc_version.py, the MicrosoftGame.config and its images, and
-    .pyc files.
+    runtime, the GDK's console runtime DLLs, vc_version.py, the
+    MicrosoftGame.config and its images, and .pyc files.
 
     `version_dict`
         renpy.version_dict, or a function returning it (only called if the
         layout has no vc_version.py).
 
-    Returns a list of warnings about the config.
+    `gdk`
+        The GDK edition to take the runtime DLLs from. Defaults to find_gdk().
+
+    Returns a list of warnings.
     """
 
+    gdk = _require_gdk(gdk)
+
     stage_runtime(dlc, target, layout, incremental)
+    stage_gdk_dlls(gdk, layout, "console")
 
     if not os.path.exists(os.path.join(layout, "renpy", "vc_version.py")):
         write_vc_version(layout, version_dict() if callable(version_dict) else version_dict)
@@ -658,7 +662,21 @@ def finish_layout(layout, dlc, target, config, version_dict, incremental=False):
     rv = stage_gameconfig(config, layout, target)
     precompile(layout, incremental)
 
+    built = (read_info(dlc) or { }).get("gdk")
+
+    if built and built != gdk_edition(gdk):
+        rv.append("The xbox DLC was built with GDK {}, but the runtime DLLs and GameOS come from GDK {}.".format(built, gdk_edition(gdk)))
+
     return rv
+
+
+def _require_gdk(gdk=None):
+    gdk = gdk or find_gdk()
+
+    if gdk is None:
+        raise XboxBuildError("No Microsoft GDK with the Xbox extensions (xbox\\redist\\GameOS.xvd) and the Xbox services extension libraries was found.")
+
+    return gdk
 
 
 ################################################################################
@@ -724,17 +742,87 @@ def gameos_path(gdk):
     return os.path.join(gdk, "xbox", "redist", "GameOS.xvd")
 
 
-def find_gdk(environ=None):
+_XSAPI_THUNKS = ("Microsoft.Xbox.Services.GDK.C.Thunks.dll", (
+    r"GRDK\ExtensionLibraries\Xbox.Services.API.C\Lib\x64\Release",
+    ))
+
+_LIBHTTPCLIENT = ("libHttpClient.GDK.dll", (
+    r"GRDK\ExtensionLibraries\Xbox.LibHttpClient\Redist\x64",
+    ))
+
+# The GDK runtime DLLs a build takes from the installed GDK (they're not
+# redistributed with Ren'Py or the xbox DLC), as (name, directories relative
+# to the GDK edition, in order of preference).
+GDK_DLLS = {
+    # Next to renpy_xbox.exe in console packages. SDL links the Xbox services
+    # (XSAPI) thunks, which load libHttpClient.
+    "console" : (_XSAPI_THUNKS, _LIBHTTPCLIENT),
+
+    # What a Windows game that uses the GDK from Python (e.g. via ctypes) needs
+    # next to its own DLLs. See build.windows_gdk_dlls.
+    "pc" : (
+        ("xgameruntime.thunks.dll", (r"windows\bin\x64", r"GRDK\GameKit\Lib")),
+        ("XCurl.dll", (r"windows\bin\x64", r"GRDK\ExtensionLibraries\Xbox.XCurl.API\Redist\x64")),
+        _LIBHTTPCLIENT,
+        _XSAPI_THUNKS,
+        ),
+    }
+
+
+def gdk_dlls(gdk, kind="console"):
     """
-    Returns the GDK edition directory (e.g. ...\\Microsoft GDK\\260402) that
-    has the console GameOS, or None. Prefers GDK_DIR, then GameDKXboxLatest,
-    then the newest installed edition.
+    Returns a list of (name, path) for the `kind` ("console" or "pc") GDK
+    runtime DLLs in the GDK edition at `gdk`. Raises XboxBuildError if any
+    are missing.
+    """
+
+    rv = [ ]
+    missing = [ ]
+
+    for name, dirs in GDK_DLLS[kind]:
+        for d in dirs:
+            path = os.path.join(gdk, d, name)
+
+            if os.path.isfile(path):
+                rv.append((name, path))
+                break
+        else:
+            missing.append(name)
+
+    if missing:
+        raise XboxBuildError("The GDK in {} is missing {}. Install the Microsoft GDK with its extension libraries.".format(gdk, ", ".join(missing)))
+
+    return rv
+
+
+def stage_gdk_dlls(gdk, dest, kind="console"):
+    """
+    Copies the `kind` GDK runtime DLLs from the GDK edition at `gdk` into the
+    directory `dest`. Returns the list of (name, source path) copied.
+    """
+
+    rv = gdk_dlls(gdk, kind)
+    os.makedirs(dest, exist_ok=True)
+
+    for name, path in rv:
+        shutil.copy2(path, os.path.join(dest, name))
+
+    return rv
+
+
+def find_gdk(environ=None, kind="console"):
+    """
+    Returns the GDK edition directory (e.g. ...\\Microsoft GDK\\260402), or
+    None. For "console", the edition must have the Xbox extensions (the
+    console GameOS); for "pc", the PC runtime DLLs. Prefers GDK_DIR, then
+    GameDKXboxLatest (console) or GameDKLatest (pc), then the newest
+    installed edition.
     """
 
     if environ is None:
         environ = os.environ
 
-    candidates = [ environ.get("GDK_DIR"), environ.get("GameDKXboxLatest") ]
+    candidates = [ environ.get("GDK_DIR"), environ.get("GameDKXboxLatest" if kind == "console" else "GameDKLatest") ]
 
     pf86 = environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
     editions = glob.glob(os.path.join(pf86, "Microsoft GDK", "[0-9]*"))
@@ -742,8 +830,18 @@ def find_gdk(environ=None):
     candidates.extend(editions)
 
     for c in candidates:
-        if c and os.path.isfile(gameos_path(c)):
-            return os.path.abspath(c)
+        if not c:
+            continue
+
+        if kind == "console" and not os.path.isfile(gameos_path(c)):
+            continue
+
+        try:
+            gdk_dlls(c, kind)
+        except XboxBuildError:
+            continue
+
+        return os.path.abspath(c)
 
     return None
 
@@ -920,6 +1018,7 @@ def full_validation(config, dlc, target, workdir, log=None):
 
     rt = runtime_path(dlc, target)
     copy_tree(rt, loose, skip=("overrides",))
+    stage_gdk_dlls(_require_gdk(), loose, "console")
 
     for w in stage_gameconfig(config, loose, target):
         if log is not None:
@@ -992,6 +1091,8 @@ def _main(argv=None):
             if not args.incremental and os.path.isdir(args.layout):
                 shutil.rmtree(args.layout)
 
+            gdk = _require_gdk()
+
             n = stage_renpy_source(args.renpy, args.layout, args.incremental)
             print("  renpy\\: {} files".format(n))
 
@@ -999,10 +1100,11 @@ def _main(argv=None):
             print("  game\\: {} files from {}".format(n, game))
 
             for w in finish_layout(args.layout, args.dlc, args.target, config,
-                    lambda : git_version_dict(args.renpy), args.incremental):
+                    lambda : git_version_dict(args.renpy), args.incremental, gdk):
                 print("  WARN: " + w)
 
             print("  runtime from {}".format(runtime_path(args.dlc, args.target)))
+            print("  GDK runtime DLLs from {}".format(gdk))
             print("  MicrosoftGame.config staged from {}".format(config))
 
             if not can_precompile():
@@ -1013,22 +1115,14 @@ def _main(argv=None):
                 print("  renpy.py replaced with {}".format(args.bootstrap))
 
         elif args.command == "pack":
-            gdk = find_gdk()
-            if gdk is None:
-                raise XboxBuildError("No GDK with Xbox extensions (xbox\\redist\\GameOS.xvd) was found.")
-
-            xvc = pack(args.layout, args.package_dir, gdk, mapfile=args.map)
+            xvc = pack(args.layout, args.package_dir, _require_gdk(), mapfile=args.map)
             print("\nPackage: {} ({:,} bytes)".format(xvc, os.path.getsize(xvc)))
 
         elif args.command == "install":
             install(find_package(args.package_dir))
 
         elif args.command == "deploy":
-            gdk = find_gdk()
-            if gdk is None:
-                raise XboxBuildError("No GDK with Xbox extensions (xbox\\redist\\GameOS.xvd) was found.")
-
-            deploy(args.layout, gdk)
+            deploy(args.layout, _require_gdk())
 
         elif args.command == "launch":
             launch(package_identity(args.config)["aumid"])

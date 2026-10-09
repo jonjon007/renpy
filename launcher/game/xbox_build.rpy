@@ -230,7 +230,7 @@ init python:
 
         try:
             warnings = xbox_background(_("Adding the Xbox runtime and compiling Python..."),
-                lambda : xbox_package.finish_layout(loose, dlc, target, xbox_config_path(p), renpy.version_dict))
+                lambda : xbox_package.finish_layout(loose, dlc, target, xbox_config_path(p), renpy.version_dict, gdk=gdk))
 
             for w in warnings:
                 log.write("Warning: {}\n".format(w))
