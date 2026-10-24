@@ -651,10 +651,11 @@ def finish_layout(layout, dlc, target, config, version_dict, incremental=False, 
     Returns a list of warnings.
     """
 
-    gdk = _require_gdk(gdk)
+    names = dlc_gdk_dlls(dlc, target)
+    gdk = _require_gdk(gdk, names)
 
     stage_runtime(dlc, target, layout, incremental)
-    stage_gdk_dlls(gdk, layout, "console")
+    stage_gdk_dlls(gdk, layout, "console", names)
 
     if not os.path.exists(os.path.join(layout, "renpy", "vc_version.py")):
         write_vc_version(layout, version_dict() if callable(version_dict) else version_dict)
@@ -670,11 +671,11 @@ def finish_layout(layout, dlc, target, config, version_dict, incremental=False, 
     return rv
 
 
-def _require_gdk(gdk=None):
-    gdk = gdk or find_gdk()
+def _require_gdk(gdk=None, names=None):
+    gdk = gdk or find_gdk(names=names)
 
     if gdk is None:
-        raise XboxBuildError("No Microsoft GDK with the Xbox extensions (xbox\\redist\\GameOS.xvd) and the Xbox services extension libraries was found.")
+        raise XboxBuildError(no_gdk_message(names))
 
     return gdk
 
@@ -742,66 +743,131 @@ def gameos_path(gdk):
     return os.path.join(gdk, "xbox", "redist", "GameOS.xvd")
 
 
-_XSAPI_THUNKS = ("Microsoft.Xbox.Services.GDK.C.Thunks.dll", (
-    r"GRDK\ExtensionLibraries\Xbox.Services.API.C\Lib\x64\Release",
-    ))
-
-_LIBHTTPCLIENT = ("libHttpClient.GDK.dll", (
-    r"GRDK\ExtensionLibraries\Xbox.LibHttpClient\Redist\x64",
-    ))
-
 # The GDK runtime DLLs a build takes from the installed GDK (they're not
-# redistributed with Ren'Py or the xbox DLC), as (name, directories relative
-# to the GDK edition, in order of preference).
-GDK_DLLS = {
-    # Next to renpy_xbox.exe in console packages. SDL links the Xbox services
-    # (XSAPI) thunks, which load libHttpClient.
-    "console" : (_XSAPI_THUNKS, _LIBHTTPCLIENT),
+# redistributed with Ren'Py or the xbox DLC).
+#
+# The Xbox services (XSAPI) thunks, and the libHttpClient they import, are
+# named differently in the GDK's simplified (cross-platform) layout and in its
+# legacy GRDK layout. The legacy layout is optional from the October 2026 GDK
+# and removed in April 2027, so the simplified layout's are preferred.
+XSAPI_DLLS = ("Microsoft.Xbox.Services.C.Thunks.dll", "libHttpClient.dll")
+XSAPI_DLLS_LEGACY = ("Microsoft.Xbox.Services.GDK.C.Thunks.dll", "libHttpClient.GDK.dll")
 
-    # What a Windows game that uses the GDK from Python (e.g. via ctypes) needs
-    # next to its own DLLs. See build.windows_gdk_dlls.
-    "pc" : (
-        ("xgameruntime.thunks.dll", (r"windows\bin\x64", r"GRDK\GameKit\Lib")),
-        ("XCurl.dll", (r"windows\bin\x64", r"GRDK\ExtensionLibraries\Xbox.XCurl.API\Redist\x64")),
-        _LIBHTTPCLIENT,
-        _XSAPI_THUNKS,
-        ),
+# What a Windows game that uses the GDK from Python (e.g. via ctypes) needs
+# next to its own DLLs, besides the XSAPI DLLs. See build.windows_gdk_dlls.
+PC_GDK_DLLS = ("xgameruntime.thunks.dll", "XCurl.dll")
+
+_GRDK_XSAPI = r"GRDK\ExtensionLibraries\Xbox.Services.API.C\Lib\x64\Release"
+_GRDK_LIBHTTPCLIENT = r"GRDK\ExtensionLibraries\Xbox.LibHttpClient\Redist\x64"
+
+# The directories, relative to the GDK edition, each DLL is taken from for
+# `kind` ("console" or "pc"), in order of preference.
+GDK_DLL_DIRS = {
+    "console" : {
+        "Microsoft.Xbox.Services.C.Thunks.dll" : (r"xbox\bin\x64",),
+        "libHttpClient.dll" : (r"xbox\bin\x64",),
+        "Microsoft.Xbox.Services.GDK.C.Thunks.dll" : (_GRDK_XSAPI,),
+        "libHttpClient.GDK.dll" : (_GRDK_LIBHTTPCLIENT,),
+        },
+
+    "pc" : {
+        "xgameruntime.thunks.dll" : (r"windows\bin\x64", r"GRDK\GameKit\Lib"),
+        "XCurl.dll" : (r"windows\bin\x64", r"GRDK\ExtensionLibraries\Xbox.XCurl.API\Redist\x64"),
+        "Microsoft.Xbox.Services.C.Thunks.dll" : (r"windows\bin\x64",),
+        "libHttpClient.dll" : (r"windows\bin\x64",),
+        "Microsoft.Xbox.Services.GDK.C.Thunks.dll" : (_GRDK_XSAPI,),
+        "libHttpClient.GDK.dll" : (_GRDK_LIBHTTPCLIENT,),
+        },
     }
 
 
-def gdk_dlls(gdk, kind="console"):
+def dlc_gdk_dlls(dlc, target):
     """
-    Returns a list of (name, path) for the `kind` ("console" or "pc") GDK
-    runtime DLLs in the GDK edition at `gdk`. Raises XboxBuildError if any
-    are missing.
+    Returns the names of the GDK runtime DLLs the DLC's `target` runtime
+    needs next to renpy_xbox.exe: the XSAPI DLLs its SDL2.dll was linked
+    against, as recorded in dlc.json by make_xbox_dlc.ps1. DLCs that don't
+    record them were built against the legacy layout.
     """
 
-    rv = [ ]
+    info = read_info(dlc) or { }
+    t = (info.get("targets") or { }).get(target)
+    names = t.get("gdk_dlls") if isinstance(t, dict) else None
+
+    return tuple(names) if names else XSAPI_DLLS_LEGACY
+
+
+def _find_gdk_dlls(gdk, kind, names):
+    """
+    Returns ([ (name, path) ], [ missing name ]) for the DLLs `names`.
+    """
+
+    found = [ ]
     missing = [ ]
 
-    for name, dirs in GDK_DLLS[kind]:
-        for d in dirs:
+    for name in names:
+        for d in GDK_DLL_DIRS[kind].get(name, ()):
             path = os.path.join(gdk, d, name)
 
             if os.path.isfile(path):
-                rv.append((name, path))
+                found.append((name, path))
                 break
         else:
             missing.append(name)
 
+    return found, missing
+
+
+def gdk_dlls(gdk, kind="console", names=None):
+    """
+    Returns a list of (name, path) for the `kind` ("console" or "pc") GDK
+    runtime DLLs in the GDK edition at `gdk`. Raises XboxBuildError if any
+    are missing.
+
+    `names`
+        The DLLs to find. By default, for "console", the XSAPI DLLs of the
+        simplified layout, or the legacy layout's if the GDK only has those.
+        For "pc", PC_GDK_DLLS and the XSAPI DLLs of each layout the GDK has
+        (games may load either set by name).
+    """
+
+    if names is not None:
+        rv, missing = _find_gdk_dlls(gdk, kind, names)
+
+    else:
+        rv, missing = _find_gdk_dlls(gdk, kind, PC_GDK_DLLS if kind == "pc" else ())
+
+        layouts = [ _find_gdk_dlls(gdk, kind, i) for i in (XSAPI_DLLS, XSAPI_DLLS_LEGACY) ]
+        complete = [ found for found, m in layouts if not m ]
+
+        if not complete:
+            missing.extend(layouts[0][1])
+        elif kind == "pc":
+            for found in complete:
+                rv.extend(found)
+        else:
+            rv.extend(complete[0])
+
     if missing:
-        raise XboxBuildError("The GDK in {} is missing {}. Install the Microsoft GDK with its extension libraries.".format(gdk, ", ".join(missing)))
+        msg = "The GDK in {} is missing {}.".format(gdk, ", ".join(missing))
+
+        if any(i in XSAPI_DLLS_LEGACY for i in missing):
+            msg += " They're in the GDK's legacy (GRDK) layout: add it with the GDK installer, or use Xbox support built for the current layout."
+        else:
+            msg += " Install the Microsoft GDK with its extension libraries."
+
+        raise XboxBuildError(msg)
 
     return rv
 
 
-def stage_gdk_dlls(gdk, dest, kind="console"):
+def stage_gdk_dlls(gdk, dest, kind="console", names=None):
     """
-    Copies the `kind` GDK runtime DLLs from the GDK edition at `gdk` into the
-    directory `dest`. Returns the list of (name, source path) copied.
+    Copies the `kind` GDK runtime DLLs (see gdk_dlls) from the GDK edition at
+    `gdk` into the directory `dest`. Returns the list of (name, source path)
+    copied.
     """
 
-    rv = gdk_dlls(gdk, kind)
+    rv = gdk_dlls(gdk, kind, names)
     os.makedirs(dest, exist_ok=True)
 
     for name, path in rv:
@@ -810,11 +876,12 @@ def stage_gdk_dlls(gdk, dest, kind="console"):
     return rv
 
 
-def find_gdk(environ=None, kind="console"):
+def find_gdk(environ=None, kind="console", names=None):
     """
     Returns the GDK edition directory (e.g. ...\\Microsoft GDK\\260402), or
     None. For "console", the edition must have the Xbox extensions (the
-    console GameOS); for "pc", the PC runtime DLLs. Prefers GDK_DIR, then
+    console GameOS); for "pc", the PC runtime DLLs. It must have the runtime
+    DLLs `names`, or by default those gdk_dlls needs. Prefers GDK_DIR, then
     GameDKXboxLatest (console) or GameDKLatest (pc), then the newest
     installed edition.
     """
@@ -837,13 +904,31 @@ def find_gdk(environ=None, kind="console"):
             continue
 
         try:
-            gdk_dlls(c, kind)
+            gdk_dlls(c, kind, names)
         except XboxBuildError:
             continue
 
         return os.path.abspath(c)
 
     return None
+
+
+def no_gdk_message(names=None, environ=None):
+    """
+    Explains why find_gdk(environ, names=names) found no console GDK.
+    """
+
+    other = find_gdk(environ) if names else None
+
+    if other is None:
+        return "No Microsoft GDK with the Xbox extensions (xbox\\redist\\GameOS.xvd) and the Xbox services runtime DLLs was found."
+
+    rv = "Xbox support needs {} from the GDK, but GDK {} doesn't have them.".format(", ".join(names), gdk_edition(other))
+
+    if any(i in XSAPI_DLLS_LEGACY for i in names):
+        rv += " This Xbox support was built with the GDK's legacy (GRDK) layout. Update Xbox support, or add the legacy layout with the GDK installer."
+
+    return rv
 
 
 def gdk_edition(gdk):
@@ -1021,7 +1106,8 @@ def full_validation(config, dlc, target, workdir, log=None):
 
     rt = runtime_path(dlc, target)
     copy_tree(rt, loose, skip=("overrides",))
-    stage_gdk_dlls(_require_gdk(), loose, "console")
+    names = dlc_gdk_dlls(dlc, target)
+    stage_gdk_dlls(_require_gdk(names=names), loose, "console", names)
 
     for w in stage_gameconfig(config, loose, target):
         if log is not None:
@@ -1108,7 +1194,7 @@ def _main(argv=None):
             if not args.incremental and os.path.isdir(args.layout):
                 shutil.rmtree(args.layout)
 
-            gdk = _require_gdk()
+            gdk = _require_gdk(names=dlc_gdk_dlls(args.dlc, args.target))
 
             n = stage_renpy_source(args.renpy, args.layout, args.incremental)
             print("  renpy\\: {} files".format(n))

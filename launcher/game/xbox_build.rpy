@@ -41,18 +41,31 @@ init python:
         ("xboxone", _("Xbox One (untested on hardware)")),
     ]
 
-    xbox_gdk_cache = [ ]
+    xbox_gdk_cache = { }
 
-    def xbox_gdk(refresh=False):
+    def xbox_gdk(refresh=False, any_layout=False):
         """
-        Returns the GDK edition directory with the Xbox extensions, or None.
-        Cached until refresh is True.
+        Returns the GDK edition directory with the Xbox extensions and the
+        runtime DLLs the xbox DLC needs for the current target (if
+        `any_layout`, those of either GDK layout), or None. Cached until
+        refresh is True.
         """
 
-        if refresh or not xbox_gdk_cache:
-            xbox_gdk_cache[:] = [ xbox_package.find_gdk() ]
+        names = None
 
-        return xbox_gdk_cache[0]
+        if not any_layout:
+            dlc, _dev = xbox_dlc()
+
+            if dlc is not None:
+                names = xbox_package.dlc_gdk_dlls(dlc, xbox_target())
+
+        if refresh:
+            xbox_gdk_cache.clear()
+
+        if names not in xbox_gdk_cache:
+            xbox_gdk_cache[names] = xbox_package.find_gdk(names=names)
+
+        return xbox_gdk_cache[names]
 
     def xbox_target():
         if persistent.xbox_target not in xbox_config.GDK_PLATFORMS:
@@ -155,6 +168,10 @@ init python:
         gdk = xbox_gdk(refresh=True)
 
         if gdk is None:
+            if xbox_gdk(any_layout=True) is not None:
+                interface.error(_("The installed Microsoft GDK doesn't have the runtime DLLs this Xbox support needs."),
+                    _("[message!q]"), message=xbox_package.no_gdk_message(xbox_package.dlc_gdk_dlls(dlc, target)), label="xbox")
+
             interface.error(_("The Microsoft GDK with the Xbox extensions was not found."),
                 _("Install it as described in the GDK documentation (see the link on the Xbox screen), then try again."), label="xbox")
 
@@ -331,6 +348,15 @@ screen xbox_build_frame():
                         $ edition = xbox_package.gdk_edition(gdk)
                         text _("GDK [edition!q].") style "l_small_text" yalign 0.5
                         textbutton _("Devkit setup (GDK docs)") style "l_small_button" action OpenURL(XBOX_DOCS_DEVKIT)
+                    elif xbox_gdk(any_layout=True):
+                        $ edition = xbox_package.gdk_edition(xbox_gdk(any_layout=True))
+                        $ names = xbox_package.dlc_gdk_dlls(dlc, xbox_target())
+
+                        if any(i in xbox_package.XSAPI_DLLS_LEGACY for i in names):
+                            text _("GDK [edition!q] doesn't have the legacy (GRDK) layout this Xbox support was built with. Update Xbox support, or add the legacy layout with the GDK installer.") style "l_small_text" color ERROR_COLOR yalign 0.5
+                        else:
+                            $ names = ", ".join(names)
+                            text _("GDK [edition!q] doesn't have [names!q], which this Xbox support needs.") style "l_small_text" color ERROR_COLOR yalign 0.5
                     else:
                         text _("Microsoft GDK (Xbox) not found.") style "l_small_text" color ERROR_COLOR yalign 0.5
                         textbutton _("GDK setup (GDK docs)") style "l_small_button" action OpenURL(XBOX_DOCS_SETUP)

@@ -485,9 +485,11 @@ The following variables provide further control of the build process:
 
     If not None, a directory in the Windows distributions (for example,
     ``"game/lib"``) that the Microsoft GDK's PC runtime DLLs
-    (xgameruntime.thunks.dll, XCurl.dll, libHttpClient.GDK.dll and
-    Microsoft.Xbox.Services.GDK.C.Thunks.dll) are copied to when building. They
-    are taken from the GDK installed on the computer doing the build (or the
-    edition given by the ``GDK_DIR`` environment variable), replacing any
-    copies in the project. This is for games that use the GDK on Windows,
-    for example through ctypes.
+    (xgameruntime.thunks.dll, XCurl.dll, libHttpClient.dll and
+    Microsoft.Xbox.Services.C.Thunks.dll) are copied to when building. If the
+    GDK also has its legacy GRDK layout installed, libHttpClient.GDK.dll and
+    Microsoft.Xbox.Services.GDK.C.Thunks.dll are copied too. They are taken
+    from the GDK installed on the computer doing the build (or the edition
+    given by the ``GDK_DIR`` environment variable), replacing any copies in
+    the project. This is for games that use the GDK on Windows, for example
+    through ctypes.
