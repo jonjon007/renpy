@@ -42,6 +42,18 @@ verifying_keys = []  # type: list[bytes]
 # True if the save files and persistent data should be upgraded.
 should_upgrade = False  # type: bool
 
+# The fixed keys and zero signature written by the console runtime's former
+# renpy.ecsign stub, before it shipped a real renpy.ecsign.
+STUB_SIGNING_KEY = b"\x01" * 32
+STUB_VERIFYING_KEY = b"\x02" * 64
+STUB_SIGNATURE = b"\x00" * 64
+
+# True if the tokens were used by that stub (they hold its signing key), so
+# that the saves and persistent data it signed still load without a prompt.
+# They're re-signed with a real key when next saved. Its verifying key alone
+# never sets this: anyone can forge its signature.
+trust_stub_signatures = False  # type: bool
+
 
 def encode_line(key, a, b=None):  # type (str, bytes, bytes|None) -> str
     """
@@ -106,6 +118,12 @@ def verify_data(data, signatures, check_verifying=True):
             if key is None or sig is None:
                 continue
 
+            if key == STUB_VERIFYING_KEY and sig == STUB_SIGNATURE:
+                if trust_stub_signatures or not check_verifying:
+                    return True
+
+                continue
+
             if check_verifying and key not in verifying_keys:
                 continue
 
@@ -161,7 +179,11 @@ def check_load(log, signatures):
     if not ask(renpy.store.gui.UNKNOWN_TOKEN):
         return False
 
-    new_keys = [i for i in get_keys_from_signatures(signatures) if i not in verifying_keys]
+    # Anyone can forge the stub's signature, so its key is never trusted
+    # through the prompt.
+    new_keys = [
+        i for i in get_keys_from_signatures(signatures) if i not in verifying_keys and i != STUB_VERIFYING_KEY
+    ]
 
     if new_keys and ask(renpy.store.gui.TRUST_TOKEN):
         keys_text = os.path.join(token_dir, "security_keys.txt")
@@ -264,9 +286,11 @@ def load_tokens(keys_fn):
 
     global signing_keys
     global verifying_keys
+    global trust_stub_signatures
 
     signing_keys = []
     verifying_keys = []
+    trust_stub_signatures = False
 
     # Load the signing and verifying keys.
     with open(keys_fn, "r") as f:
@@ -274,6 +298,9 @@ def load_tokens(keys_fn):
             kind, key, _ = decode_line(l)
 
             if kind == "signing-key":
+                if key == STUB_SIGNING_KEY:
+                    trust_stub_signatures = True
+
                 public = renpy.ecsign.get_public_key_from_private(key)
                 if public is not None:
                     signing_keys.append(key)

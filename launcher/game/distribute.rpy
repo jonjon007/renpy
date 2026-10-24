@@ -708,6 +708,7 @@ fix_dlc("xbox", "xbox/dlc.json")
                 self.add_mac_files()
 
             self.add_windows_files()
+            self.add_windows_gdk(build_packages)
             self.add_windows_gdk_dlls(build_packages)
 
             # Add the main.py.
@@ -1282,6 +1283,65 @@ fix_dlc("xbox", "xbox/dlc.json")
 
             write_exe("lib/py3-windows-x86_64/renpy.exe", self.exe, self.exe, windows)
             write_exe("lib/py3-windows-x86_64/pythonw.exe", "lib/py3-windows-x86_64/pythonw.exe", "pythonw-64.exe", windows)
+
+        def add_windows_gdk(self, build_packages):
+            """
+            If build.windows_gdk is set and a Windows package is being built,
+            adds what GDK services (renpy/common/00gdk.rpy) need on PC: the
+            _gdk module and the VC++ runtime from the SDK's
+            lib/gdk-windows-x86_64, the GDK's PC runtime DLLs from the
+            installed GDK, and a PC MicrosoftGame.config (made from the
+            project's xbox/MicrosoftGame.config) next to the executable.
+            """
+
+            if not self.build.get("windows_gdk") or self.build['renpy']:
+                return
+
+            if not any("windows" in p["file_lists"] for p in build_packages):
+                return
+
+            import xbox_package
+
+            lib = os.path.join(config.renpy_base, xbox_package.PC_GDK_LIB.replace("/", os.sep))
+
+            if not os.path.isfile(os.path.join(lib, "_gdk.pyd")):
+                raise Exception("build.windows_gdk is set, but this Ren'Py SDK has no {}/_gdk.pyd.".format(xbox_package.PC_GDK_LIB))
+
+            names = xbox_package.PC_GDK_DLLS + xbox_package.XSAPI_DLLS
+            gdk = xbox_package.find_gdk(kind="pc", names=names)
+
+            if gdk is None:
+                raise Exception("build.windows_gdk is set, but no Microsoft GDK with the PC runtime DLLs ({}) was found. Install the GDK, or set GDK_DIR to its edition directory.".format(", ".join(names)))
+
+            files = [ (i, os.path.join(lib, i)) for i in sorted(os.listdir(lib)) if i.lower().endswith((".pyd", ".dll")) ]
+            files.extend(xbox_package.gdk_dlls(gdk, "pc", names))
+
+            gameconfig = os.path.join(self.project.path, "xbox", "MicrosoftGame.config")
+
+            if not os.path.isfile(gameconfig):
+                raise Exception("build.windows_gdk is set, but {} doesn't exist. Create it with the launcher's Xbox screen.".format(gameconfig))
+
+            data, images, warnings = xbox_package.pc_gameconfig(gameconfig, self.exe)
+
+            for i in warnings:
+                self.log.write("Warning: " + i + "\n")
+
+            tmp = self.temp_filename("MicrosoftGame.config")
+
+            with open(tmp, "wb") as f:
+                f.write(data)
+
+            added = [ (xbox_package.PC_GDK_LIB + "/" + name, path) for name, path in files ]
+            added.append(("MicrosoftGame.config", tmp))
+            added.extend(images)
+
+            for name, path in added:
+                for fl in self.file_lists.values():
+                    fl[:] = [ i for i in fl if i.name.lower() != name.lower() ]
+
+                self.add_file("windows", name, path)
+
+            self.log.write("Added GDK services for Windows, with the GDK runtime DLLs from {}.\n".format(gdk))
 
         def add_windows_gdk_dlls(self, build_packages):
             """

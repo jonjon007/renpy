@@ -376,6 +376,10 @@ auto_save_extra_info = None
 # game-specific data is saved.
 save_directory = None  # type: str|None
 
+# If true, a Windows GDK build (build.windows_gdk) keeps its saves in the
+# signed-in user's XGameSaveFiles folder, so they roam between PCs and Xbox.
+gdk_saves = False
+
 # These are used to deal with the case where a picture is missing.
 missing_scene = None
 missing_show = None

@@ -73,6 +73,8 @@ RUNTIME_REQUIRED = (
     "overrides/renpy/ecsign.py",
     "overrides/renpy/gl2/assimp.py",
     "modules/_renpy.pyd",
+    "modules/_gdk.pyd",
+    "modules/renpy.ecsign.pyd",
     "modules/pygame_sdl2.display.pyd",
     "modules/unicodedata.pyd",
 )
@@ -584,6 +586,60 @@ def stage_gameconfig(config, layout, target):
 
 
 PRECOMPILE_DIRS = ("renpy", "pygame_sdl2", os.path.join("lib", "python3.12"))
+
+
+# Where a Windows build.windows_gdk distribution (and the SDK) has the PC _gdk
+# module, relative to the Ren'Py base.
+PC_GDK_LIB = "lib/gdk-windows-x86_64"
+
+
+def pc_gameconfig(config, exe):
+    """
+    Makes the MicrosoftGame.config of a Windows GDK build from the project's
+    console one at `config`: TargetDeviceFamily becomes PC, and the
+    executable `exe` (the game's .exe name).
+
+    Returns (data, images, warnings): the config's bytes, a list of
+    (relative path, source path) for the ShellVisuals images it references,
+    and a list of warnings about the images that don't exist.
+    """
+
+    if not os.path.isfile(config):
+        raise XboxBuildError("{} was not found.".format(config))
+
+    with open(config, "rb") as f:
+        data = f.read()
+
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as e:
+        raise XboxBuildError("{} is not well-formed XML: {}".format(config, e))
+
+    data = re.sub(br"""(TargetDeviceFamily\s*=\s*["'])[^"']*""", br"\1PC", data)
+
+    data, count = re.subn(br"""(<Executable\b[^>]*?\bName\s*=\s*["'])[^"']*""",
+        lambda m : m.group(1) + exe.encode("utf-8"), data, count=1)
+
+    if not count:
+        raise XboxBuildError("{} has no Executable element.".format(config))
+
+    images = [ ]
+    warnings = [ ]
+
+    for attr, rel in xbox_config.referenced_images(root):
+        rel = rel.replace("\\", "/")
+
+        if os.path.isabs(rel) or ".." in rel.split("/"):
+            raise XboxBuildError("{} '{}' points outside the game.".format(attr, rel))
+
+        src = xbox_config.image_path(config, rel)
+
+        if os.path.isfile(src):
+            images.append((rel, src))
+        else:
+            warnings.append("{} '{}' was not found next to {}.".format(attr, rel, config))
+
+    return data, images, warnings
 
 
 def can_precompile():

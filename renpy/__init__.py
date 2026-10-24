@@ -189,6 +189,7 @@ backup_blacklist = {
     "renpy.log",
     "renpy.bootstrap",
     "renpy.debug",
+    "renpy.gdk",
     "renpy.display",
     "renpy.display.pgrender",
     "renpy.display.presplash",
@@ -413,6 +414,7 @@ def import_all():
     import renpy.loadsave
     import renpy.savelocation
     import renpy.savetoken
+    import renpy.gdk
     import renpy.persistent
     import renpy.scriptedit
     import renpy.parser
@@ -743,6 +745,7 @@ if typing.TYPE_CHECKING:
     from . import rollback as rollback
     from . import savelocation as savelocation
     from . import savetoken as savetoken
+    from . import gdk as gdk
     from . import screenlang as screenlang
     from . import script as script
     from . import scriptedit as scriptedit

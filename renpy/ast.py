@@ -60,6 +60,7 @@ if True:
 # and then again at init time.
 EARLY_CONFIG = {
     "save_directory",
+    "gdk_saves",
     "allow_duplicate_labels",
     "keyword_after_python",
     "steam_appid",

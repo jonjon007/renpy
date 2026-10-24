@@ -107,6 +107,12 @@ def path_to_saves(gamedir, save_directory=None): # type: (str, str|None) -> str
 
     import renpy # @UnresolvedImport
 
+    # A Windows GDK build with config.gdk_saves keeps saves in the cloud folder.
+    gdk = getattr(renpy, "gdk", None)
+    rv = gdk.path_to_saves(save_directory) if gdk is not None else None
+    if rv is not None:
+        return rv
+
     if save_directory is None:
         save_directory = renpy.config.save_directory
         save_directory = renpy.exports.fsencode(save_directory) # type: ignore

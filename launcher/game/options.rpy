@@ -429,6 +429,9 @@ init python:
 
     build.classify_renpy("renpy3.sh", "binary")
 
+    # The PC GDK module (xbox-build's build_gdk_module.bat), for build.windows_gdk.
+    build.classify_renpy("lib/gdk-windows-x86_64/**", "binary")
+
     build.classify_renpy("lib/", "binary")
 
     # Packages.

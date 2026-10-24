@@ -425,6 +425,10 @@ def main():
 
     renpy.game.exception_info = "After loading the script."
 
+    # GDK sign-in, and on PC the cloud save folder, come before the save directory.
+    renpy.gdk.init()
+    renpy.gdk.prepare_saves(renpy.config.gamedir)
+
     # Find the save directory.
     if renpy.config.savedir is None:
         renpy.config.savedir = renpy.__main__.path_to_saves(renpy.config.gamedir)  # E1101 @UndefinedVariable
@@ -469,6 +473,7 @@ def main():
         renpy.persistent.update()
         if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
             renpy.__main__.xbox_merge_local_persistent()
+        renpy.gdk.merge_local_persistent()
         game.preferences = game.persistent._preferences
         log_clock("Loading persistent")
 

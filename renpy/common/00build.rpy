@@ -115,6 +115,9 @@ init -1500 python in build:
         # Ignore the wrong Python.
         ( "lib/py2-*/", None),
 
+        # The PC GDK module, added to Windows builds by build.windows_gdk.
+        ( "lib/gdk-*/", None),
+
         # Windows patterns.
         ( "lib/py*-windows-i686/**", "windows_i686"),
         ( "lib/py*-windows-x86_64/**", "windows"),
@@ -527,6 +530,12 @@ init -1500 python in build:
     # the building machine, or None to not include them.
     windows_gdk_dlls = None
 
+    # Should Windows distributions use Microsoft GDK services (gdk.*, the GDK
+    # achievement backend, and cloud saves with config.gdk_saves)? This adds
+    # the _gdk module, the GDK's PC runtime DLLs, and a PC MicrosoftGame.config
+    # made from the project's xbox/MicrosoftGame.config.
+    windows_gdk = False
+
     # Should the gameonly update be available?
     game_only_update = False
 
@@ -633,6 +642,7 @@ init -1500 python in build:
         rv["update_formats"] = update_formats
 
         rv["windows_gdk_dlls"] = windows_gdk_dlls
+        rv["windows_gdk"] = windows_gdk
 
         rv["info"] = {
             "info" : info,
