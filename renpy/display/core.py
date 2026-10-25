@@ -1128,6 +1128,11 @@ class Interface:
         if os.environ.get("RENPY_PLATFORM", "").startswith("xbox"):
             renderers = ["sdlrenderer", "sw"]
 
+        # Elsewhere sdlrenderer is only used when explicitly requested, to debug
+        # the Xbox backend on a PC (see xbox-build/tools/pc_sdlrenderer).
+        elif renderer == "sdlrenderer":
+            renderers = ["sdlrenderer"] + renderers
+
         # Software renderer is the last hope for PC .
         if not (renpy.android or renpy.ios or renpy.emscripten):
             if "sw" not in renderers:

@@ -48,17 +48,6 @@ def set_rgba_masks():
     global sample_alpha
     global sample_noalpha
 
-    # Use ARGB8888 masks directly. On Xbox D3D12, the texture format is
-    # DXGI_FORMAT_B8G8R8A8_UNORM which corresponds to SDL_PIXELFORMAT_ARGB8888.
-    # Using matching masks avoids format conversion during texture upload,
-    # which can corrupt the alpha channel on some D3D12 implementations.
-    if os.environ.get("RENPY_RENDERER") == "sdlrenderer":
-        masks = (0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000)
-        sample_alpha = pygame.Surface((10, 10), 0, 32, masks)
-        sample_noalpha = pygame.Surface((10, 10), 0, 32, masks[:3] + (0,))
-        renpy.audio.audio.sample_surfaces(sample_noalpha, sample_alpha)
-        return
-
     # Annoyingly, the value for the big mask seems to vary from
     # platform to platform. So we read it out of a surface.
 

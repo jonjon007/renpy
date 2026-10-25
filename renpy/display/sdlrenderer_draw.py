@@ -35,6 +35,7 @@ import os
 import sys
 import threading
 import time
+import weakref
 import collections
 
 import renpy
@@ -60,12 +61,205 @@ def _on_main_thread():
     return threading.current_thread() is threading.main_thread()
 
 
-def _clear_target(renderer, w, h):
-    """Clear the current render target to opaque black."""
-    renderer.set_draw_blend_mode(BLENDMODE_NONE)
-    renderer.clear((0, 0, 0, 255))
-    renderer.fill_rect((0, 0, 0, 255), (0, 0, w, h))
-    renderer.set_draw_blend_mode(BLENDMODE_BLEND)
+# 2D affine matrices are tuples (a, b, c, d, e, f):
+#   x' = a*x + b*y + c
+#   y' = d*x + e*y + f
+_IDENTITY = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+
+# (zdz, zdw) of an identity model matrix.
+_Z_IDENTITY = (1.0, 0.0)
+_QUAD_INDICES = [0, 1, 2, 0, 2, 3]
+
+# Half-size of the clip box on an axis that isn't clipped (GL2's BIG_PIXELS).
+_BIG_PIXELS = 1000000.0
+
+# Below this, nothing is visible in an 8-bit target.
+_MIN_ALPHA = 1.0 / 512.0
+
+# Forces the next _apply_clip() to call set_clip_rect.
+_NO_CLIP_APPLIED = ("unset",)
+
+
+def _mat_mul(m, n):
+    a, b, c, d, e, f = m
+    A, B, C, D, E, F = n
+    return (a * A + b * D, a * B + b * E, a * C + b * F + c,
+            d * A + e * D, d * B + e * E, d * C + e * F + f)
+
+
+def _is_projective(rev):
+    """True if `rev` can't be split into a 2D affine part plus z (zdz, zdw):
+    perspective cameras, and x/y rotation that mixes z into x and y."""
+    return (rev.wdx != 0.0 or rev.wdy != 0.0 or rev.wdz != 0.0 or rev.wdw != 1.0 or
+            rev.xdz != 0.0 or rev.ydz != 0.0 or rev.zdx != 0.0 or rev.zdy != 0.0)
+
+
+def _reverse_matrix(render, full=False):
+    """
+    The matrix for render.reverse (child -> render space), or None.
+
+    Normally the 2D affine part as a 6-tuple (z is tracked separately). When
+    `full` is true or the matrix is projective, the 4x4 Matrix itself is
+    returned and the subtree is drawn with full 3D math.
+    """
+    rev = render.reverse
+    if rev is None:
+        return None
+
+    if full or _is_projective(rev):
+        return rev
+
+    m = (rev.xdx, rev.xdy, rev.xdw, rev.ydx, rev.ydy, rev.ydw)
+    if m == _IDENTITY:
+        return None
+
+    return m
+
+
+def _reverse_z(render):
+    """(zdz, zdw) of render.reverse when it moves or scales z, else None."""
+    rev = render.reverse
+    if rev is None:
+        return None
+
+    zdz = rev.zdz
+    zdw = rev.zdw
+    if zdw == 0.0 and zdz == 1.0:
+        return None
+
+    return (zdz, zdw)
+
+
+def _to_matrix(m, z):
+    """A 4x4 Matrix from a 2D affine 6-tuple and its (zdz, zdw)."""
+    a, b, c, d, e, f = m
+    return renpy.display.matrix.Matrix((
+        a, b, 0.0, c,
+        d, e, 0.0, f,
+        0.0, 0.0, z[0], z[1],
+        0.0, 0.0, 0.0, 1.0))
+
+
+def _child_matrix(m, cx, cy, rev):
+    """GL2: child model = parent * offset(cx, cy) * render.reverse."""
+    if type(m) is not tuple or (rev is not None and type(rev) is not tuple):
+        Matrix = renpy.display.matrix.Matrix
+        if type(m) is tuple:
+            m = _to_matrix(m, _Z_IDENTITY)
+        if cx or cy:
+            m = m * Matrix.offset(cx, cy, 0.0)
+        if rev is not None:
+            m = m * rev
+        return m
+
+    if cx or cy:
+        a, b, c, d, e, f = m
+        m = (a, b, a * cx + b * cy + c, d, e, d * cx + e * cy + f)
+    if rev is not None:
+        m = _mat_mul(m, rev)
+    return m
+
+
+def _mul_scale(m, sx, sy):
+    """m * scale(sx, sy)."""
+    if type(m) is tuple:
+        return _mat_mul(m, (sx, 0.0, 0.0, 0.0, sy, 0.0))
+    return m * renpy.display.matrix.Matrix.scale(sx, sy, 1.0)
+
+
+def _project(m, x, y):
+    """(x, y, z, w) of local point (x, y) through a 4x4 Matrix, divided by w.
+    None if the point is at or behind the eye."""
+    px, py, pz, pw = m.transform(x, y, 0.0, 1.0, 4)
+    if pw <= 1e-6:
+        return None
+    return (px / pw, py / pw, pz / pw, pw)
+
+
+def _bbox(m, x0, y0, x1, y1):
+    """Drawable-space bounding box (x0, y0, x1, y1) of a local rectangle."""
+    if type(m) is not tuple:
+        pts = [_project(m, x, y) for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))]
+        if None in pts:
+            return (-_BIG_PIXELS, -_BIG_PIXELS, _BIG_PIXELS, _BIG_PIXELS)
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return (min(xs), min(ys), max(xs), max(ys))
+
+    a, b, c, d, e, f = m
+    xs = (a * x0 + b * y0, a * x1 + b * y0, a * x1 + b * y1, a * x0 + b * y1)
+    ys = (d * x0 + e * y0, d * x1 + e * y0, d * x1 + e * y1, d * x0 + e * y1)
+    return (min(xs) + c, min(ys) + f, max(xs) + c, max(ys) + f)
+
+
+def _color_byte(v):
+    if v <= 0.0:
+        return 0
+    if v >= 1.0:
+        return 255
+    return int(v * 255.0 + 0.5)
+
+
+def _compose_blend(src_color, dst_color, src_alpha, dst_alpha):
+    """SDL_ComposeCustomBlendMode with SDL_BLENDOPERATION_ADD."""
+    add = 1
+    return (add | (src_color << 4) | (dst_color << 8) |
+            (add << 16) | (src_alpha << 20) | (dst_alpha << 24))
+
+
+def _classify_matrixcolor(cm):
+    """
+    Returns ("identity", None), ("tint", (r, g, b)) when the matrix only
+    scales rgb by factors in [0, 1] (drawable with vertex color), or
+    ("general", rows) with rows a 4-tuple of 4-tuples.
+    """
+    rows = (
+        (cm.xdx, cm.xdy, cm.xdz, cm.xdw),
+        (cm.ydx, cm.ydy, cm.ydz, cm.ydw),
+        (cm.zdx, cm.zdy, cm.zdz, cm.zdw),
+        (cm.wdx, cm.wdy, cm.wdz, cm.wdw),
+    )
+
+    eps = 1e-6
+    diagonal = all(abs(rows[i][j]) < eps for i in range(4) for j in range(4) if i != j)
+
+    if diagonal and abs(rows[3][3] - 1.0) < eps:
+        tint = (rows[0][0], rows[1][1], rows[2][2])
+        if all(abs(t - 1.0) < eps for t in tint):
+            return "identity", None
+        if all(-eps <= t <= 1.0 + eps for t in tint):
+            return "tint", tint
+
+    return "general", tuple(tuple(round(v, 5) for v in row) for row in rows)
+
+
+def _straight_colormatrix(rows, premultiplied):
+    """
+    The 20-element list for renpy.display.module.colormatrix that gives the
+    result of GL2's matrixcolor (M * premultiplied color).
+
+    On premultiplied pixels that is M itself. On straight-alpha pixels,
+    M * (a*rgb, a) = a * (M[:, :3] * rgb + M[:, 3]), so the alpha column acts
+    as a constant offset on straight color. When the alpha row is (0, 0, 0, k)
+    the result alpha is k*a, so the color is divided by k to stay straight.
+    """
+    if premultiplied:
+        rv = []
+        for row in rows:
+            rv.extend(row)
+            rv.append(0.0)
+        return rv
+
+    arow = rows[3]
+    k = 1.0
+    if abs(arow[0]) + abs(arow[1]) + abs(arow[2]) < 1e-6 and arow[3] > 1e-6:
+        k = arow[3]
+
+    rv = []
+    for row in rows[:3]:
+        rv.extend([row[0] / k, row[1] / k, row[2] / k, 0.0, row[3] / k])
+    rv.extend([arow[0], arow[1], arow[2], arow[3], 0.0])
+    return rv
 
 
 class TextureCache:
@@ -151,6 +345,8 @@ class TextureCache:
             return None
 
         tex.set_blend_mode(BLENDMODE_BLEND)
+        # SDL's default sampling is nearest; GL2 samples scaled images linearly.
+        tex.set_scale_mode(SCALEMODE_LINEAR)
         nbytes = sw * sh * 4
         self.entries[sid] = [surf, tex, nbytes, self.frame]
         self.bytes += nbytes
@@ -223,6 +419,18 @@ class SDLRendererDraw:
     2D compositing. On Xbox this maps to D3D12, on Windows to D3D11.
     """
 
+    # SDL_BlendFactor: ZERO=1, ONE=2, SRC_ALPHA=5, ONE_MINUS_SRC_ALPHA=6.
+    BLEND_PREMULTIPLIED = _compose_blend(2, 6, 2, 6)
+    BLEND_MASK = _compose_blend(1, 5, 1, 5)
+    BLEND_MASK_INVERTED = _compose_blend(1, 6, 1, 6)
+
+    MATRIXCOLOR_CACHE_SIZE = 64
+    TARGET_MAX_AGE = 120
+    MAX_TARGET_SIZE = 4096
+
+    # Grid used for quads whose w varies (3D rotation under perspective).
+    PROJECTED_GRID = 8
+
     def __init__(self):
         self.renderer = None
         self.texture_cache = None
@@ -248,8 +456,27 @@ class SDLRendererDraw:
         self.next_frame = 0
         self.fast_redraw_frames = 0
 
-        # Nesting depth for clip rects (we restore by popping)
-        self._clip_stack = []
+        # Drawable-space clip box (x0, y0, x1, y1) of the node being drawn,
+        # and the one last given to SDL.
+        self._clip = None
+        self._applied_clip = _NO_CLIP_APPLIED
+
+        # (zdz, zdw) of the current model matrix. Without perspective, GL2
+        # clips anything whose z leaves [-1, 1] (e.g. zpos -3000).
+        self._z = _Z_IDENTITY
+
+        # Render targets: (texture, previous target, saved clip, saved z) while
+        # drawing into them, a per-size pool reused across frames, and this frame's.
+        self._target_stack = []
+        self._rt_free = {}
+        self._rt_used = []
+
+        # id(surface) -> weakref for surfaces holding premultiplied color.
+        self._premultiplied = {}
+
+        # (id(surface), matrix, premultiplied) -> (surface, recolored surface)
+        self._matrixcolor_cache = collections.OrderedDict()
+        self._grid_indices = {}
 
         # Debug frame counter — log verbose for first N frames
         self._frame_count = 0
@@ -284,6 +511,11 @@ class SDLRendererDraw:
                 window_size,
                 flags,
             )
+
+            # Surfaces in RGBA byte order (what ftfont and the decoders write),
+            # and the sample surfaces ffmedia needs to decode video frames.
+            # Needs the window, as GL2 and swdraw also do it after set_mode.
+            renpy.display.pgrender.set_rgba_masks()
 
             # Query window size to verify
             win_obj = pygame.display.get_window()
@@ -372,9 +604,8 @@ class SDLRendererDraw:
 
     def quit(self):
         """Shut down the renderer."""
-        if self.texture_cache:
-            self.texture_cache.clear()
-            self.texture_cache = None
+        self.kill_textures()
+        self.texture_cache = None
         self.renderer = None
         self.window = None
 
@@ -429,8 +660,16 @@ class SDLRendererDraw:
         if self.texture_cache:
             self.texture_cache.invalidate(surf)
 
+        sid = id(surf)
+        cache = self._matrixcolor_cache
+        for key in [k for k in list(cache) if k[0] == sid]:
+            cache.pop(key, None)
+
     def load_texture(self, surf, transient=False, properties=None):
         """Upload a surface to a GPU texture. Returns the surface for caching."""
+        if properties and properties.get("premultiplied", False):
+            self._mark_premultiplied(surf)
+
         if self.texture_cache is None:
             return surf
 
@@ -452,6 +691,20 @@ class SDLRendererDraw:
 
     def kill_textures(self):
         """Destroy all cached textures."""
+        self._matrixcolor_cache.clear()
+
+        targets = [tex for key, tex in self._rt_used]
+        for pool in self._rt_free.values():
+            targets.extend(tex for tex, last in pool)
+        self._rt_used = []
+        self._rt_free = {}
+
+        for tex in targets:
+            try:
+                tex.destroy()
+            except Exception:
+                pass
+
         if self.texture_cache:
             self.texture_cache.clear()
 
@@ -485,6 +738,12 @@ class SDLRendererDraw:
 
     # -------------------------------------------------------------------------
     # Main rendering
+    #
+    # The render tree is walked the way gl2draw.draw_one walks it: every node
+    # carries a 2D affine matrix from its local space to the drawable, a
+    # drawable-space clip rectangle, and the merged alpha/over/matrixcolor
+    # uniforms. Leaves are emitted as textured quads with SDL_RenderGeometry,
+    # which handles rotation, shear and flips the same way GL2 does.
     # -------------------------------------------------------------------------
 
     def draw_screen(self, surftree, flip=True):
@@ -501,13 +760,11 @@ class SDLRendererDraw:
             self._dump_tree(surftree, 0, 3)
 
         try:
-            # Clear screen
+            self._reset_draw_state()
             self.renderer.clear((0, 0, 0, 255))
+            self._draw(surftree, _IDENTITY, 1.0, 1.0, None)
+            self._reset_draw_state()
 
-            # Walk the render tree
-            self._draw_render(surftree, 0.0, 0.0, 1.0, None)
-
-            # Present
             if flip:
                 self.renderer.render_present()
 
@@ -517,9 +774,26 @@ class SDLRendererDraw:
             _dbg("draw_screen: EXCEPTION frame %d: %s" % (self._frame_count, e))
             import traceback
             _dbg(traceback.format_exc())
+
+            # A failure inside a render target or clip must not leak into the
+            # following frames (it would hide everything drawn later).
+            self._reset_draw_state()
         finally:
-            if self.texture_cache is not None:
-                self.texture_cache.end_frame()
+            self._end_frame()
+
+    def _end_frame(self):
+        self._release_targets()
+        if self.texture_cache is not None:
+            self.texture_cache.end_frame()
+
+    def _reset_draw_state(self):
+        if self._target_stack:
+            self._target_stack = []
+            self.renderer.set_render_target(None)
+        self._clip = None
+        self._applied_clip = _NO_CLIP_APPLIED
+        self._z = _Z_IDENTITY
+        self.renderer.set_clip_rect(None)
 
     def _get_texture(self, surf):
         """Get the GPUTexture for a pygame Surface, uploading it on first use.
@@ -535,375 +809,510 @@ class SDLRendererDraw:
         except Exception:
             return None
 
-    def _draw_render(self, render, x, y, alpha, clip):
-        """Recursively draw a Render tree node."""
+    # Premultiplied surfaces ---------------------------------------------------
 
-        if render is None:
-            return
+    def _mark_premultiplied(self, surf):
+        sid = id(surf)
+        registry = self._premultiplied
 
-        # Handle special operations
-        if render.operation != BLIT:
-            self._draw_special(render, x, y, alpha)
-            return
-
-        # Always skip render.surface and traverse children instead.
-        # On Xbox D3D12, render.surface gets set to render target read-back
-        # surfaces (via Render.render_to_texture) which have corrupted alpha.
-        # Our per-frame texture cache creates correct textures from the
-        # original source surfaces found in the render tree children.
-
-        # Set up clipping
-        pushed_clip = False
-        if render.xclipping or render.yclipping:
-            cw = render.width if render.xclipping else 32767
-            ch = render.height if render.yclipping else 32767
-            clip_rect = (int(x), int(y), int(cw), int(ch))
-            self._push_clip(clip_rect)
-            pushed_clip = True
-
-        # Draw children back to front
-        effective_alpha = alpha * render.alpha
-
-        for child, cx, cy, focus, main in render.children:
-            child_x = x + cx
-            child_y = y + cy
-
-            if isinstance(child, renpy.display.render.Render):
-                # Check for transforms
-                if child.forward is not None:
-                    self._draw_transformed(child, child_x, child_y, effective_alpha)
-                else:
-                    self._draw_render(child, child_x, child_y, effective_alpha, clip)
-            else:
-                # It's a pygame Surface
-                tex = self._get_texture(child)
-                if tex is not None:
-                    a_byte = max(0, min(255, int(effective_alpha * 255)))
-                    tex.set_alpha_mod(a_byte)
-                    tex.set_blend_mode(BLENDMODE_BLEND)
-                    self.renderer.render_copy_f(
-                        tex, None,
-                        (child_x, child_y, float(tex.w), float(tex.h))
-                    )
-
-        if pushed_clip:
-            self._pop_clip()
-
-    def _is_identity(self, matrix):
-        """Check if a Matrix2D is close to identity."""
-        return (abs(matrix.xdx - 1.0) < 0.001 and abs(matrix.ydy - 1.0) < 0.001
-                and abs(matrix.xdy) < 0.001 and abs(matrix.ydx) < 0.001)
-
-    def _is_scale_only(self, matrix):
-        """Check if a Matrix2D is scale-only (no rotation/shear)."""
-        return abs(matrix.xdy) < 0.001 and abs(matrix.ydx) < 0.001
-
-    def _draw_transformed(self, render, x, y, alpha):
-        """Draw a render with an affine transform.
-
-        For identity transforms, just recurse normally (no render target needed).
-        For scale-only, propagate scale to children's destination rects.
-        For rotation/shear, render to texture then use geometry.
-        """
-
-        matrix = render.forward
-        if matrix is None or self._is_identity(matrix):
-            # Identity — no visual transform needed, just recurse
-            self._draw_render(render, x, y, alpha, None)
-            return
-
-        # Special operations (DISSOLVE, FLATTEN, etc.) must go through
-        # _draw_render → _draw_special to be handled correctly. Transforms
-        # on these renders are for coordinate mapping, not visual scaling.
-        if render.operation != BLIT:
-            self._draw_render(render, x, y, alpha, None)
-            return
-
-        reverse = render.reverse
-        effective_alpha = alpha * render.alpha
-
-        if self._is_scale_only(matrix):
-            # Scale only — draw children with scaled positions and sizes.
-            # reverse.xdx/ydy are the scale factors (child→parent)
-            sx = reverse.xdx if reverse else 1.0
-            sy = reverse.ydy if reverse else 1.0
-            self._draw_render_scaled(render, x, y, effective_alpha, sx, sy)
-            return
-
-        # Complex transform (rotation/shear) — use SDL_RenderCopyExF or fallback
-        self._draw_transformed_rtt(render, x, y, alpha)
-
-    def _draw_render_scaled(self, render, x, y, alpha, sx, sy):
-        """Draw a render's children with a uniform scale applied to positions and sizes."""
-
-        # Special operations (DISSOLVE, FLATTEN, etc.) must be handled by
-        # _draw_render → _draw_special, not by iterating children directly.
-        if render.operation != BLIT:
-            self._draw_render(render, x, y, alpha, None)
-            return
-
-        # Set up clipping (in parent space)
-        pushed_clip = False
-        if render.xclipping or render.yclipping:
-            cw = render.width if render.xclipping else 32767
-            ch = render.height if render.yclipping else 32767
-            clip_rect = (int(x), int(y), int(cw), int(ch))
-            self._push_clip(clip_rect)
-            pushed_clip = True
-
-        for child, cx, cy, focus, main in render.children:
-            # Transform child position from child space to parent space
-            child_x = x + cx * sx
-            child_y = y + cy * sy
-
-            if isinstance(child, renpy.display.render.Render):
-                if child.operation != BLIT:
-                    # Special operation on child — delegate to _draw_render
-                    self._draw_render(child, child_x, child_y, alpha, None)
-                elif child.forward is not None and not self._is_identity(child.forward):
-                    # Nested transform
-                    self._draw_transformed(child, child_x, child_y, alpha)
-                else:
-                    # Recurse into children, propagating scale.
-                    # Do NOT use child.surface — it may contain RTT readback
-                    # data with corrupted alpha (D3D12 checkerboard artifacts).
-                    self._draw_render_scaled(child, child_x, child_y,
-                                            alpha * child.alpha, sx, sy)
-            else:
-                # pygame Surface
-                tex = self._get_texture(child)
-                if tex is not None:
-                    a_byte = max(0, min(255, int(alpha * 255)))
-                    tex.set_alpha_mod(a_byte)
-                    tex.set_blend_mode(BLENDMODE_BLEND)
-                    self.renderer.render_copy_f(
-                        tex, None,
-                        (child_x, child_y,
-                         float(tex.w) * sx, float(tex.h) * sy)
-                    )
-
-        if pushed_clip:
-            self._pop_clip()
-
-    def _draw_transformed_rtt(self, render, x, y, alpha):
-        """Draw a render with complex transform (rotation/shear).
-
-        Prefers SDL_RenderCopyExF for single-surface children (avoids
-        render targets which have alpha-clear issues on Xbox D3D12).
-        Falls back to render-to-texture + geometry for multi-child subtrees.
-        """
-
-        matrix = render.forward
-        if matrix is None:
-            self._draw_render(render, x, y, alpha, None)
-            return
-
-        effective_alpha = alpha * render.alpha
-        a_byte = max(0, min(255, int(effective_alpha * 255)))
-
-        pw = float(render.width)
-        ph = float(render.height)
-
-        # Extract rotation angle from the forward matrix.
-        # forward: xdx=cos(θ) xdy=sin(θ) ydx=-sin(θ) ydy=cos(θ)
-        # SDL_RenderCopyExF expects degrees, clockwise.
-        angle_rad = math.atan2(matrix.xdy, matrix.xdx)
-        angle_deg = math.degrees(angle_rad)
-
-        # Try direct rotation for single-child renders (no RTT needed)
-        children = render.children
-        if len(children) == 1:
-            child, cx, cy, focus, main = children[0]
-
-            # Get the texture to rotate — only use actual leaf surfaces,
-            # NOT child.surface which may be corrupted RTT readback data.
-            tex = None
-            if isinstance(child, renpy.display.render.Render):
-                # Skip child.surface — traverse children to find leaf textures
-                if len(child.children) == 1:
-                    gc = child.children[0][0]
-                    if not isinstance(gc, renpy.display.render.Render):
-                        tex = self._get_texture(gc)
-                    elif len(gc.children) == 1:
-                        ggc = gc.children[0][0]
-                        if not isinstance(ggc, renpy.display.render.Render):
-                            tex = self._get_texture(ggc)
-            else:
-                tex = self._get_texture(child)
-
-            if tex is not None:
-                tex.set_alpha_mod(a_byte)
-                if render.over < 1.0:
-                    tex.set_blend_mode(BLENDMODE_ADD)
-                else:
-                    tex.set_blend_mode(BLENDMODE_BLEND)
-
-                # Destination rect centers the texture at the render position
-                dst = (x + cx, y + cy, float(tex.w), float(tex.h))
-                # Rotate around the center of the destination rect
-                center = (float(tex.w) / 2.0, float(tex.h) / 2.0)
-
-                self.renderer.render_copy_ex_f(
-                    tex, None, dst, angle_deg, center, 0)
-                return
-
-        # Fallback: multi-child or couldn't get texture — draw children
-        # directly with combined alpha (accepting slight visual difference
-        # vs true composited rotation, but avoids RTT checkerboard)
-        for child, cx, cy, focus, main in children:
-            if isinstance(child, renpy.display.render.Render):
-                self._draw_render(child, x + cx, y + cy, effective_alpha, None)
-            else:
-                tex = self._get_texture(child)
-                if tex is not None:
-                    tex.set_alpha_mod(a_byte)
-                    tex.set_blend_mode(BLENDMODE_BLEND)
-                    self.renderer.render_copy_f(
-                        tex, None,
-                        (x + cx, y + cy, float(tex.w), float(tex.h))
-                    )
-
-    def _render_subtree_to_texture(self, render):
-        """Render a subtree into a GPU texture via render target."""
-
-        w = max(1, int(math.ceil(render.width)))
-        h = max(1, int(math.ceil(render.height)))
-        _dbg("_render_subtree_to_texture: %dx%d" % (w, h))
-
-        if w <= 0 or h <= 0:
-            return None
+        def forget(ref, sid=sid, registry=registry):
+            if registry.get(sid) is ref:
+                registry.pop(sid, None)
 
         try:
-            target = self.renderer.create_target_texture(w, h)
-        except Exception:
-            return None
+            registry[sid] = weakref.ref(surf, forget)
+        except TypeError:
+            pass
 
-        # Save current target, render subtree, restore
-        self.renderer.set_render_target(target)
-        _clear_target(self.renderer, w, h)
+    def _is_premultiplied(self, surf):
+        ref = self._premultiplied.get(id(surf))
+        return ref is not None and ref() is surf
 
-        # Draw children into the target at (0,0)
-        for child, cx, cy, focus, main in render.children:
-            if isinstance(child, renpy.display.render.Render):
-                self._draw_render(child, cx, cy, 1.0, None)
+    # Clipping -------------------------------------------------------------------
+
+    def _clip_render(self, render, m):
+        """Intersect the clip with render's (0, 0, w, h) box. False if empty."""
+        big = _BIG_PIXELS
+        x0 = 0.0 if render.xclipping else -big
+        x1 = render.width if render.xclipping else big
+        y0 = 0.0 if render.yclipping else -big
+        y1 = render.height if render.yclipping else big
+
+        return self._clip_bbox(_bbox(m, x0, y0, x1, y1))
+
+    def _clip_bbox(self, box):
+        clip = self._clip
+        if clip is not None:
+            box = (max(box[0], clip[0]), max(box[1], clip[1]),
+                   min(box[2], clip[2]), min(box[3], clip[3]))
+
+        if box[2] - box[0] < 0.01 or box[3] - box[1] < 0.01:
+            return False
+
+        self._clip = box
+        return True
+
+    def _apply_clip(self):
+        clip = self._clip
+        if clip is self._applied_clip:
+            return
+
+        self._applied_clip = clip
+
+        if clip is None:
+            self.renderer.set_clip_rect(None)
+            return
+
+        lo, hi = -_BIG_PIXELS, _BIG_PIXELS
+        x0 = int(math.floor(max(lo, min(hi, clip[0]))))
+        y0 = int(math.floor(max(lo, min(hi, clip[1]))))
+        x1 = int(math.ceil(max(lo, min(hi, clip[2]))))
+        y1 = int(math.ceil(max(lo, min(hi, clip[3]))))
+        self.renderer.set_clip_rect((x0, y0, max(0, x1 - x0), max(0, y1 - y0)))
+
+    # Tree walk ------------------------------------------------------------------
+
+    def _draw(self, what, m, alpha, over, cm):
+        """Draw `what` with local-to-drawable matrix `m`."""
+
+        if what is None:
+            return
+
+        if not isinstance(what, renpy.display.render.Render):
+            self._draw_surface(what, m, alpha, over, cm)
+            return
+
+        r = what
+
+        alpha *= r.alpha
+        over *= r.over
+
+        if alpha <= _MIN_ALPHA:
+            return
+
+        saved_clip = self._clip
+        saved_z = self._z
+
+        if (r.xclipping or r.yclipping) and not self._clip_render(r, m):
+            self._clip = saved_clip
+            return
+
+        try:
+            rev = _reverse_matrix(r, type(m) is not tuple)
+
+            if rev is not None and type(rev) is not tuple:
+                if type(m) is tuple:
+                    m = _to_matrix(m, saved_z)
             else:
-                tex = self._get_texture(child)
-                if tex is not None:
-                    tex.set_alpha_mod(255)
-                    tex.set_blend_mode(BLENDMODE_BLEND)
-                    self.renderer.render_copy_f(
-                        tex, None,
-                        (cx, cy, float(tex.w), float(tex.h))
-                    )
+                rz = _reverse_z(r)
+                if rz is not None:
+                    zdz, zdw = saved_z
+                    self._z = (zdz * rz[0], zdz * rz[1] + zdw)
 
-        self.renderer.set_render_target(None)
-        return target
+            uniforms = r.uniforms
+            if uniforms:
+                matrixcolor = uniforms.get("u_renpy_matrixcolor", None)
+                if matrixcolor is not None:
+                    cm = matrixcolor if cm is None else cm * matrixcolor
 
-    # -------------------------------------------------------------------------
-    # Special effects
-    # -------------------------------------------------------------------------
+            op = r.operation
 
-    def _draw_special(self, render, x, y, alpha):
-        """Handle DISSOLVE, IMAGEDISSOLVE, PIXELLATE, FLATTEN."""
+            if op == DISSOLVE:
+                self._draw_dissolve(r, m, rev, alpha, over, cm)
+            elif op == IMAGEDISSOLVE:
+                self._draw_imagedissolve(r, m, rev, alpha, over, cm)
+            elif op == PIXELLATE:
+                self._draw_pixellate(r, m, rev, alpha, over, cm)
+            elif r.shaders and "renpy.mask" in r.shaders and len(r.children) >= 2:
+                self._draw_alphamask(r, m, rev, alpha, over, cm)
+            else:
+                # BLIT, and FLATTEN drawn without an intermediate texture (the
+                # only difference is overlap within a translucent subtree).
+                self._draw_children(r, m, rev, alpha, over, cm)
+        finally:
+            self._clip = saved_clip
+            self._z = saved_z
 
-        op = render.operation
-        children = render.children
+    def _draw_children(self, r, m, rev, alpha, over, cm):
+        for child, cx, cy, focus, main in r.children:
+            self._draw(child, _child_matrix(m, cx, cy, rev), alpha, over, cm)
 
-        if op == DISSOLVE:
-            self._draw_dissolve(render, x, y, alpha)
-        elif op == IMAGEDISSOLVE:
-            self._draw_imagedissolve(render, x, y, alpha)
-        elif op == PIXELLATE:
-            self._draw_pixellate(render, x, y, alpha)
-        elif op == FLATTEN:
-            self._draw_flatten(render, x, y, alpha)
+    def _draw_surface(self, surf, m, alpha, over, cm):
+        """Draw a leaf pygame Surface as a quad through `m`."""
+
+        try:
+            w, h = surf.get_size()
+        except Exception:
+            return
+
+        if w <= 0 or h <= 0:
+            return
+
+        # Outside GL2's depth range. (In 3D mode z is checked per vertex.)
+        if type(m) is tuple and not -1.0 <= self._z[1] <= 1.0:
+            return
+
+        box = _bbox(m, 0.0, 0.0, w, h)
+        clip = self._clip
+        if clip is not None and (box[2] <= clip[0] or box[0] >= clip[2] or
+                                 box[3] <= clip[1] or box[1] >= clip[3]):
+            return
+
+        premultiplied = self._is_premultiplied(surf)
+        tint = None
+
+        if cm is not None:
+            kind, value = _classify_matrixcolor(cm)
+            if kind == "tint":
+                tint = value
+            elif kind == "general":
+                surf = self._matrixcolor_surface(surf, value, premultiplied)
+
+        tex = self._get_texture(surf)
+        if tex is None:
+            return
+
+        # Text is laid out on the pixel grid; keep it crisp the way GL2's
+        # pixel_perfect does.
+        if premultiplied and type(m) is tuple and m[0] == 1.0 and m[4] == 1.0 and m[1] == 0.0 and m[3] == 0.0:
+            m = (1.0, 0.0, float(round(m[2])), 0.0, 1.0, float(round(m[5])))
+
+        self._draw_quad(tex, m, w, h, alpha, over, premultiplied, tint)
+
+    def _draw_quad(self, tex, m, w, h, alpha, over, premultiplied, tint=None):
+        """Draw a texture covering local (0, 0, w, h) with Ren'Py alpha/over."""
+
+        tr, tg, tb = tint if tint is not None else (1.0, 1.0, 1.0)
+
+        if premultiplied:
+            # out = tex * (alpha, alpha, alpha, alpha*over), blended (ONE, 1-SA)
+            tex.set_blend_mode(self.BLEND_PREMULTIPLIED)
+            self._emit_quad(tex, m, w, h, (alpha * tr, alpha * tg, alpha * tb, alpha * over))
+            return
+
+        if over >= 0.999:
+            tex.set_blend_mode(BLENDMODE_BLEND)
+            self._emit_quad(tex, m, w, h, (tr, tg, tb, alpha))
+        elif over <= 0.001:
+            tex.set_blend_mode(BLENDMODE_ADD)
+            self._emit_quad(tex, m, w, h, (tr, tg, tb, alpha))
         else:
-            # Unknown op — try to draw children normally
-            for child, cx, cy, focus, main in children:
-                if isinstance(child, renpy.display.render.Render):
-                    self._draw_render(child, x + cx, y + cy, alpha, None)
+            # Straight alpha: rgb*a*alpha + dst*(1 - a*alpha*over), split into
+            # a normal pass and an additive pass.
+            tex.set_blend_mode(BLENDMODE_BLEND)
+            self._emit_quad(tex, m, w, h, (tr, tg, tb, alpha * over))
+            tex.set_blend_mode(BLENDMODE_ADD)
+            self._emit_quad(tex, m, w, h, (tr, tg, tb, alpha * (1.0 - over)))
 
-    def _draw_dissolve(self, render, x, y, alpha):
-        """Cross-fade between bottom and top children.
+    def _emit_quad(self, tex, m, w, h, color):
+        self._apply_clip()
 
-        Draws directly to the backbuffer without render targets to avoid
-        D3D12 checkerboard artifacts. Uses correct alpha math:
-        bottom at full alpha, top at complete*alpha, producing
-        screen = top*t + bottom*(1-t) for opaque sources.
+        r = _color_byte(color[0])
+        g = _color_byte(color[1])
+        b = _color_byte(color[2])
+        a = _color_byte(color[3])
+
+        if a == 0 and r == 0 and g == 0 and b == 0:
+            return
+
+        if type(m) is not tuple:
+            self._emit_projected_quad(tex, m, w, h, (r, g, b, a))
+            return
+
+        x0 = m[2]
+        y0 = m[5]
+        ax = m[0] * w
+        ay = m[3] * w
+        bx = m[1] * h
+        by = m[4] * h
+
+        self.renderer.render_geometry(tex, [
+            (x0, y0, r, g, b, a, 0.0, 0.0),
+            (x0 + ax, y0 + ay, r, g, b, a, 1.0, 0.0),
+            (x0 + ax + bx, y0 + ay + by, r, g, b, a, 1.0, 1.0),
+            (x0 + bx, y0 + by, r, g, b, a, 0.0, 1.0),
+        ], _QUAD_INDICES)
+
+    def _emit_projected_quad(self, tex, m, w, h, rgba):
         """
-        children = render.children
+        Draw local (0, 0, w, h) through a 4x4 (possibly perspective) Matrix.
+
+        SDL interpolates texture coordinates linearly in screen space, which is
+        exact while w is constant over the quad (anything facing the camera).
+        Otherwise the quad is split into a grid so the error stays small.
+        """
+        r, g, b, a = rgba
+
+        corners = [_project(m, x, y) for x, y in ((0.0, 0.0), (w, 0.0), (w, h), (0.0, h))]
+
+        # Behind the eye, or entirely outside GL2's depth range.
+        if None in corners:
+            return
+        if all(p[2] > 1.0 for p in corners) or all(p[2] < -1.0 for p in corners):
+            return
+
+        ws = [p[3] for p in corners]
+        if max(ws) - min(ws) <= 0.005 * max(ws):
+            self.renderer.render_geometry(tex, [
+                (corners[0][0], corners[0][1], r, g, b, a, 0.0, 0.0),
+                (corners[1][0], corners[1][1], r, g, b, a, 1.0, 0.0),
+                (corners[2][0], corners[2][1], r, g, b, a, 1.0, 1.0),
+                (corners[3][0], corners[3][1], r, g, b, a, 0.0, 1.0),
+            ], _QUAD_INDICES)
+            return
+
+        n = self.PROJECTED_GRID
+        vertices = [ ]
+        for j in range(n + 1):
+            v = float(j) / n
+            for i in range(n + 1):
+                u = float(i) / n
+                p = _project(m, u * w, v * h)
+                if p is None:
+                    return
+                vertices.append((p[0], p[1], r, g, b, a, u, v))
+
+        indices = self._grid_indices.get(n)
+        if indices is None:
+            indices = [ ]
+            for j in range(n):
+                for i in range(n):
+                    k = j * (n + 1) + i
+                    indices.extend((k, k + 1, k + n + 2, k, k + n + 2, k + n + 1))
+            self._grid_indices[n] = indices
+
+        self.renderer.render_geometry(tex, vertices, indices)
+
+    # matrixcolor ------------------------------------------------------------------
+
+    def _matrixcolor_surface(self, surf, rows, premultiplied):
+        """
+        Returns a copy of `surf` with the 4x4 color matrix `rows` applied,
+        matching GL2's renpy.matrixcolor (which works on premultiplied color).
+        Results are cached per (surface, matrix).
+        """
+
+        key = (id(surf), rows, premultiplied)
+        cache = self._matrixcolor_cache
+
+        entry = cache.get(key)
+        if entry is not None and entry[0] is surf:
+            cache.move_to_end(key)
+            return entry[1]
+
+        w, h = surf.get_size()
+
+        try:
+            src = pygame.Surface((w, h), pygame.SRCALPHA, 32)
+            renpy.display.accelerator.nogil_copy(surf, src)
+            dst = pygame.Surface((w, h), pygame.SRCALPHA, 32)
+            renpy.display.module.colormatrix(src, dst, _straight_colormatrix(rows, premultiplied))
+        except Exception as e:
+            _dbg("matrixcolor: failed: %s" % e)
+            return surf
+
+        if premultiplied:
+            self._mark_premultiplied(dst)
+
+        cache[key] = (surf, dst)
+        while len(cache) > self.MATRIXCOLOR_CACHE_SIZE:
+            cache.popitem(last=False)
+
+        return dst
+
+    # Render targets -------------------------------------------------------------------
+
+    def _acquire_target(self, w, h):
+        key = (w, h)
+        free = self._rt_free.get(key)
+
+        tex = None
+        while free and tex is None:
+            tex = free.pop()[0]
+            if not tex.valid:
+                tex = None
+
+        if tex is None:
+            tex = self.renderer.create_target_texture(w, h)
+            tex.set_blend_mode(self.BLEND_PREMULTIPLIED)
+
+        # Pixellate leaves its target on nearest sampling.
+        tex.set_scale_mode(SCALEMODE_LINEAR)
+
+        self._rt_used.append((key, tex))
+        return tex
+
+    def _release_targets(self):
+        frame = self._frame_count
+
+        for key, tex in self._rt_used:
+            self._rt_free.setdefault(key, []).append((tex, frame))
+        self._rt_used = []
+
+        retired = self.texture_cache.retired if self.texture_cache is not None else None
+
+        for key in list(self._rt_free):
+            keep = []
+            for tex, last in self._rt_free[key]:
+                if frame - last > self.TARGET_MAX_AGE:
+                    if retired is not None:
+                        retired.append(tex)
+                else:
+                    keep.append((tex, last))
+            if keep:
+                self._rt_free[key] = keep
+            else:
+                del self._rt_free[key]
+
+    def _push_target(self, w, h):
+        """Make a transparent w x h render target current. Returns it."""
+        tex = self._acquire_target(w, h)
+
+        previous = self._target_stack[-1][0] if self._target_stack else None
+        self._target_stack.append((tex, previous, self._clip, self._z))
+
+        self.renderer.set_render_target(tex)
+        self._clip = None
+        self._applied_clip = _NO_CLIP_APPLIED
+        self._z = _Z_IDENTITY
+        self.renderer.set_clip_rect(None)
+
+        self.renderer.set_draw_blend_mode(BLENDMODE_NONE)
+        self.renderer.clear((0, 0, 0, 0))
+        self.renderer.fill_rect((0, 0, 0, 0), (0, 0, w, h))
+        self.renderer.set_draw_blend_mode(BLENDMODE_BLEND)
+
+        return tex
+
+    def _pop_target(self):
+        tex, previous, clip, z = self._target_stack.pop()
+        self.renderer.set_render_target(previous)
+        self._clip = clip
+        self._z = z
+        self._applied_clip = _NO_CLIP_APPLIED
+        return tex
+
+    def _target_scale(self, m, w, h):
+        """Texture size and scale for rendering a w x h subtree drawn by m."""
+        if type(m) is tuple:
+            sx = math.hypot(m[0], m[3])
+            sy = math.hypot(m[1], m[4])
+        else:
+            box = _bbox(m, 0.0, 0.0, w, h)
+            sx = (box[2] - box[0]) / max(w, 1e-6)
+            sy = (box[3] - box[1]) / max(h, 1e-6)
+
+        sx = max(0.05, min(4.0, sx))
+        sy = max(0.05, min(4.0, sy))
+
+        tw = int(math.ceil(w * sx))
+        th = int(math.ceil(h * sy))
+
+        limit = self.MAX_TARGET_SIZE
+        if tw > limit:
+            sx *= float(limit) / tw
+            tw = limit
+        if th > limit:
+            sy *= float(limit) / th
+            th = limit
+
+        return max(1, tw), max(1, th), sx, sy
+
+    def _render_children_to_target(self, r, children, rev, sx, sy, tw, th, cm=None):
+        """Draw (child, cx, cy) children of r into a fresh tw x th target."""
+        tex = self._push_target(tw, th)
+        try:
+            base = (sx, 0.0, 0.0, 0.0, sy, 0.0)
+            for child, cx, cy in children:
+                self._draw(child, _child_matrix(base, cx, cy, rev), 1.0, 1.0, cm)
+        finally:
+            self._pop_target()
+        return tex
+
+    # Special operations -------------------------------------------------------------
+
+    def _draw_alphamask(self, r, m, rev, alpha, over, cm):
+        """
+        AlphaMask (shader renpy.mask): child color times mask alpha.
+
+        The child is drawn into a target, the mask into a second one, and the
+        mask target is multiplied into the child target with a (ZERO, SRC_ALPHA)
+        blend. The result is premultiplied and is drawn through `m`.
+        """
+
+        w, h = r.width, r.height
+        if w <= 0 or h <= 0:
+            return
+
+        tw, th, sx, sy = self._target_scale(m, w, h)
+
+        child, ccx, ccy = r.children[0][:3]
+        mask, mcx, mcy = r.children[1][:3]
+
+        uniforms = r.uniforms or {}
+        inverted = uniforms.get("u_renpy_mask_multiplier", 1) < 0
+
+        try:
+            mask_tex = self._render_children_to_target(r, [(mask, mcx, mcy)], rev, sx, sy, tw, th)
+            child_tex = self._push_target(tw, th)
+            try:
+                base = (sx, 0.0, 0.0, 0.0, sy, 0.0)
+                self._draw(child, _child_matrix(base, ccx, ccy, rev), 1.0, 1.0, cm)
+
+                mask_tex.set_blend_mode(self.BLEND_MASK_INVERTED if inverted else self.BLEND_MASK)
+                self._emit_quad(mask_tex, _IDENTITY, tw, th, (1.0, 1.0, 1.0, 1.0))
+            finally:
+                self._pop_target()
+        except Exception as e:
+            _dbg("alphamask: render target failed (%s); drawing unmasked" % e)
+            self._draw_children(r, m, rev, alpha, over, cm)
+            return
+
+        self._draw_quad(child_tex, _mul_scale(m, 1.0 / sx, 1.0 / sy),
+                        tw, th, alpha, over, True)
+
+    def _draw_dissolve(self, r, m, rev, alpha, over, cm):
+        """Cross-fade: bottom at full alpha, then top at complete * alpha.
+
+        Drawn straight to the current target (no intermediate textures); for
+        an opaque bottom this is screen = top*t + bottom*(1-t).
+        """
+        children = r.children
         if len(children) < 2:
             return
 
-        complete = render.operation_complete
-        effective_alpha = alpha * render.alpha
+        # Without models, Dissolve doesn't crop its children to its size.
+        if not self._clip_bbox(_bbox(m, 0.0, 0.0, r.width, r.height)):
+            return
 
-        bottom_render = children[0][0]
-        top_render = children[1][0]
+        complete = max(0.0, min(1.0, r.operation_complete))
 
-        if self._frame_count <= self._dbg_frames:
-            bottom_op = getattr(bottom_render, 'operation', -1) if isinstance(bottom_render, renpy.display.render.Render) else 'surf'
-            bottom_nc = len(getattr(bottom_render, 'children', [])) if isinstance(bottom_render, renpy.display.render.Render) else 0
-            top_op = getattr(top_render, 'operation', -1) if isinstance(top_render, renpy.display.render.Render) else 'surf'
-            top_nc = len(getattr(top_render, 'children', [])) if isinstance(top_render, renpy.display.render.Render) else 0
-            _dbg("dissolve: frame=%d complete=%.3f eff_alpha=%.3f "
-                 "bottom(op=%s,nc=%d) top(op=%s,nc=%d)" % (
-                     self._frame_count, complete, effective_alpha,
-                     bottom_op, bottom_nc, top_op, top_nc))
+        bottom, bx, by = children[0][:3]
+        top, tx, ty = children[1][:3]
 
-        # Draw bottom scene at full effective alpha
-        if isinstance(bottom_render, renpy.display.render.Render):
-            self._draw_transformed(bottom_render, x, y, effective_alpha)
-        else:
-            tex = self._get_texture(bottom_render)
-            if tex is not None:
-                a = max(0, min(255, int(effective_alpha * 255)))
-                tex.set_alpha_mod(a)
-                tex.set_blend_mode(BLENDMODE_BLEND)
-                self.renderer.render_copy_f(
-                    tex, None,
-                    (x, y, float(tex.w), float(tex.h))
-                )
+        self._draw(bottom, _child_matrix(m, bx, by, rev), alpha, over, cm)
 
-        # Draw top scene at complete * alpha
-        top_alpha = complete * effective_alpha
-        if top_alpha > 0.001:
-            if isinstance(top_render, renpy.display.render.Render):
-                self._draw_transformed(top_render, x, y, top_alpha)
-            else:
-                tex = self._get_texture(top_render)
-                if tex is not None:
-                    a = max(0, min(255, int(top_alpha * 255)))
-                    tex.set_alpha_mod(a)
-                    tex.set_blend_mode(BLENDMODE_BLEND)
-                    self.renderer.render_copy_f(
-                        tex, None,
-                        (x, y, float(tex.w), float(tex.h))
-                    )
+        top_alpha = alpha * complete
+        if top_alpha > _MIN_ALPHA:
+            self._draw(top, _child_matrix(m, tx, ty, rev), top_alpha, over, cm)
 
-    def _draw_imagedissolve(self, render, x, y, alpha):
+    def _draw_imagedissolve(self, r, m, rev, alpha, over, cm):
         """Image-dissolve using a mask. CPU fallback via _renpy.imageblend."""
-        children = render.children
+        children = r.children
         if len(children) < 3:
             return
 
-        complete = render.operation_complete
-        param = render.operation_parameter
+        complete = r.operation_complete
+        param = r.operation_parameter
 
-        bottom_render = children[0][0]
-        top_render = children[1][0]
-        mask_render = children[2][0]
+        w = max(1, int(math.ceil(r.width)))
+        h = max(1, int(math.ceil(r.height)))
 
-        w = max(1, int(math.ceil(render.width)))
-        h = max(1, int(math.ceil(render.height)))
-        if w <= 0 or h <= 0:
-            return
+        surfs = [ ]
+        for child, cx, cy, focus, main in children[:3]:
+            surfs.append(self._render_to_surface_at(child, _child_matrix(_IDENTITY, cx, cy, rev), w, h, cm))
 
-        # Render all three to surfaces for CPU processing
-        bottom_surf = self._render_to_surface(bottom_render, w, h, True)
-        top_surf = self._render_to_surface(top_render, w, h, True)
-        mask_surf = self._render_to_surface(mask_render, w, h, True)
-
+        bottom_surf, top_surf, mask_surf = surfs
         if bottom_surf is None or top_surf is None or mask_surf is None:
             return
 
@@ -911,227 +1320,97 @@ class SDLRendererDraw:
         step = max(1, int(256 * param))
         position = int(complete * (256 + step))
 
-        ramp = b""
+        ramp = bytearray(256)
         for i in range(256):
             if i < position - step:
-                ramp += b"\xff"
+                ramp[i] = 255
             elif i >= position:
-                ramp += b"\x00"
+                ramp[i] = 0
             else:
                 v = 255 - int(255 * (i - (position - step)) / step)
-                ramp += bytes([max(0, min(255, v))])
+                ramp[i] = max(0, min(255, v))
+        ramp = bytes(ramp)
 
-        # Use _renpy.imageblend for CPU-based per-pixel mask blending
         dst_surf = pygame.Surface((w, h), pygame.SRCALPHA, 32)
         try:
-            renpy.display.module.imageblend(
-                bottom_surf, top_surf, dst_surf, mask_surf, ramp)
+            renpy.display.module.imageblend(bottom_surf, top_surf, dst_surf, mask_surf, ramp)
         except Exception:
-            # Fallback: just draw based on completion
-            if complete < 0.5:
-                dst_surf = bottom_surf
-            else:
-                dst_surf = top_surf
+            dst_surf = bottom_surf if complete < 0.5 else top_surf
 
-        # Upload and draw the result
-        tex = self.renderer.create_texture_from_surface(dst_surf)
-        tex.set_blend_mode(BLENDMODE_BLEND)
-        effective_alpha = alpha * render.alpha
-        a_byte = max(0, min(255, int(effective_alpha * 255)))
-        tex.set_alpha_mod(a_byte)
-        self.renderer.render_copy_f(
-            tex, None,
-            (x, y, float(w), float(h))
-        )
-        tex.destroy()
+        # The inputs were read back from transparent render targets, so the
+        # blend is premultiplied too.
+        self._mark_premultiplied(dst_surf)
+        tex = self._get_texture(dst_surf)
+        if tex is not None:
+            self._draw_quad(tex, m, w, h, alpha, over, True)
 
-    def _draw_pixellate(self, render, x, y, alpha):
-        """Pixellate effect using downsample + nearest-neighbor upscale."""
-        children = render.children
+    def _draw_pixellate(self, r, m, rev, alpha, over, cm):
+        """Pixellate: render small, then upscale with nearest-neighbor."""
+        children = r.children
         if not children:
             return
 
-        child_render = children[0][0]
-        param = max(1, int(render.operation_parameter))
+        child, cx, cy = children[0][:3]
+        param = max(1, int(r.operation_parameter))
 
-        w = max(1, int(math.ceil(render.width)))
-        h = max(1, int(math.ceil(render.height)))
-        if w <= 0 or h <= 0:
-            return
+        w = max(1, int(math.ceil(r.width)))
+        h = max(1, int(math.ceil(r.height)))
 
-        # Render child to full-size texture
-        full_tex = self._flatten_to_texture(child_render, w, h)
-        if full_tex is None:
-            return
-
-        # Downsample: render to a small target
         small_w = max(1, w // param)
         small_h = max(1, h // param)
 
         try:
-            small_target = self.renderer.create_target_texture(small_w, small_h)
-            self.renderer.set_render_target(small_target)
-            _clear_target(self.renderer, small_w, small_h)
+            small = self._render_children_to_target(
+                r, [(child, cx, cy)], rev,
+                float(small_w) / w, float(small_h) / h, small_w, small_h, cm)
+        except Exception as e:
+            _dbg("pixellate: render target failed (%s); drawing unpixellated" % e)
+            self._draw_children(r, m, rev, alpha, over, cm)
+            return
 
-            # Copy full texture to small target (automatic downscale)
-            full_tex.set_scale_mode(SCALEMODE_LINEAR)
-            self.renderer.render_copy_f(
-                full_tex, None,
-                (0.0, 0.0, float(small_w), float(small_h))
-            )
-            self.renderer.set_render_target(None)
+        small.set_scale_mode(SCALEMODE_NEAREST)
+        self._draw_quad(small, _mul_scale(m, float(w) / small_w, float(h) / small_h),
+                        small_w, small_h, alpha, over, True)
 
-            # Upscale with nearest-neighbor for blocky effect
-            small_target.set_scale_mode(SCALEMODE_NEAREST)
+    # Read-back helpers -------------------------------------------------------------
 
-            effective_alpha = alpha * render.alpha
-            a_byte = max(0, min(255, int(effective_alpha * 255)))
-            small_target.set_alpha_mod(a_byte)
-            small_target.set_blend_mode(BLENDMODE_BLEND)
-
-            self.renderer.render_copy_f(
-                small_target, None,
-                (x, y, float(w), float(h))
-            )
-
-            small_target.destroy()
-        except Exception:
-            # Fallback: draw without pixellation
-            effective_alpha = alpha * render.alpha
-            a_byte = max(0, min(255, int(effective_alpha * 255)))
-            full_tex.set_alpha_mod(a_byte)
-            full_tex.set_blend_mode(BLENDMODE_BLEND)
-            self.renderer.render_copy_f(
-                full_tex, None,
-                (x, y, float(w), float(h))
-            )
-
-        full_tex.destroy()
-
-    def _draw_flatten(self, render, x, y, alpha):
-        """Flatten a subtree by drawing children directly with combined alpha.
-
-        Avoids render-to-texture entirely — on Xbox D3D12, render target
-        clears don't reliably write alpha=0, causing checkerboard artifacts.
-        Per-child alpha is visually identical for non-overlapping children
-        and imperceptibly different for overlapping ones.
+    def _render_to_surface_at(self, what, m, w, h, cm=None):
         """
-        effective_alpha = alpha * render.alpha
-        blend = BLENDMODE_ADD if render.over < 1.0 else BLENDMODE_BLEND
-
-        for child, cx, cy, focus, main in render.children:
-            if isinstance(child, renpy.display.render.Render):
-                self._draw_render(child, x + cx, y + cy, effective_alpha, None)
-            else:
-                tex = self._get_texture(child)
-                if tex is not None:
-                    a_byte = max(0, min(255, int(effective_alpha * 255)))
-                    tex.set_alpha_mod(a_byte)
-                    tex.set_blend_mode(blend)
-                    self.renderer.render_copy_f(
-                        tex, None,
-                        (x + cx, y + cy,
-                         float(tex.w), float(tex.h))
-                    )
-
-    # -------------------------------------------------------------------------
-    # Helpers
-    # -------------------------------------------------------------------------
-
-    def _flatten_to_texture(self, render, w, h):
-        """Render a render tree to a GPU texture of given size."""
+        Draw `what` with matrix `m` into a transparent w x h target and read
+        it back. The returned Surface holds premultiplied color.
+        """
         if w <= 0 or h <= 0:
             return None
 
-        w = max(1, w)
-        h = max(1, h)
-
         try:
-            target = self.renderer.create_target_texture(w, h)
+            self._push_target(w, h)
         except Exception:
             return None
 
-        self.renderer.set_render_target(target)
-        _clear_target(self.renderer, w, h)
-
-        if isinstance(render, renpy.display.render.Render):
-            self._draw_render(render, 0, 0, 1.0, None)
-        else:
-            tex = self._get_texture(render)
-            if tex is not None:
-                tex.set_alpha_mod(255)
-                self.renderer.render_copy_f(tex, None, (0, 0, float(w), float(h)))
-
-        self.renderer.set_render_target(None)
-        return target
-
-    def _flatten_to_texture_from_render(self, render, w, h):
-        """Flatten a render's children into a target texture."""
-        if w <= 0 or h <= 0:
-            return None
-
-        w = max(1, w)
-        h = max(1, h)
-
         try:
-            target = self.renderer.create_target_texture(w, h)
-        except Exception:
-            return None
+            self._draw(what, m, 1.0, 1.0, cm)
+            surf = self.renderer.render_read_pixels()
+        except Exception as e:
+            _dbg("_render_to_surface: failed: %s" % e)
+            surf = None
+        finally:
+            tex = self._pop_target()
 
-        self.renderer.set_render_target(target)
-        _clear_target(self.renderer, w, h)
+        # Nothing samples the target after the read-back, so it can be reused.
+        for i, (key, used) in enumerate(self._rt_used):
+            if used is tex:
+                del self._rt_used[i]
+                self._rt_free.setdefault(key, []).append((tex, self._frame_count))
+                break
 
-        for child, cx, cy, focus, main in render.children:
-            if isinstance(child, renpy.display.render.Render):
-                self._draw_render(child, cx, cy, 1.0, None)
-            else:
-                tex = self._get_texture(child)
-                if tex is not None:
-                    tex.set_alpha_mod(255)
-                    tex.set_blend_mode(BLENDMODE_BLEND)
-                    self.renderer.render_copy_f(
-                        tex, None,
-                        (cx, cy, float(tex.w), float(tex.h))
-                    )
+        if surf is not None:
+            self._mark_premultiplied(surf)
 
-        self.renderer.set_render_target(None)
-        return target
+        return surf
 
     def _render_to_surface(self, render, w, h, alpha=True):
         """Render a render tree to a pygame Surface (for CPU operations)."""
-        if w <= 0 or h <= 0:
-            return None
-
-        # Render to texture, then read back
-        tex = self._flatten_to_texture(render, w, h)
-        if tex is None:
-            return None
-
-        self.renderer.set_render_target(tex)
-        try:
-            surf = self.renderer.render_read_pixels()
-        except Exception:
-            self.renderer.set_render_target(None)
-            tex.destroy()
-            return None
-
-        self.renderer.set_render_target(None)
-        tex.destroy()
-        return surf
-
-    def _push_clip(self, rect):
-        """Push a clip rectangle onto the stack."""
-        self._clip_stack.append(rect)
-        self.renderer.set_clip_rect(rect)
-
-    def _pop_clip(self):
-        """Pop the clip rectangle stack."""
-        if self._clip_stack:
-            self._clip_stack.pop()
-        if self._clip_stack:
-            self.renderer.set_clip_rect(self._clip_stack[-1])
-        else:
-            self.renderer.set_clip_rect(None)
+        return self._render_to_surface_at(render, _IDENTITY, w, h)
 
     # -------------------------------------------------------------------------
     # Compositing to texture (public interface)
@@ -1159,11 +1438,9 @@ class SDLRendererDraw:
             return True
 
         # Use the existing cached surface if available, but do NOT cache
-        # new surfaces from render_to_texture on the Render object.
-        # On Xbox D3D12, _render_to_surface reads back from a render target
-        # that may have checkerboard artifacts in transparent areas. If we
-        # cached that surface on render.surface, _draw_render would draw
-        # the corrupted surface instead of traversing the render tree.
+        # new surfaces from render_to_texture on the Render object: the
+        # renderer always draws from the render tree, and a stale snapshot
+        # stashed on render.surface would never be refreshed.
         surf = what.surface
         if surf is None:
             surf = self.render_to_texture(what, True)
