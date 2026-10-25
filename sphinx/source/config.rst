@@ -1187,6 +1187,14 @@ Saving and Loading
 
     See also :var:`config.autosave_prefix_callback`.
 
+.. var:: config.gdk_saves = False
+
+    If true, Windows builds with :var:`build.windows_gdk` keep saves,
+    persistent data and save keys in the signed-in user's Xbox cloud save
+    folder (XGameSaveFiles), shared with Xbox. Saves already in the usual
+    location are copied in the first time a user signs in. If no one is
+    signed in, saves stay local.
+
 .. var:: config.has_autosave = True
 
     If True, the game will autosave. If False, no autosaving will

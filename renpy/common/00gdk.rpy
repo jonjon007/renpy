@@ -19,9 +19,7 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-# Microsoft GDK services, the same on Windows (build.windows_gdk) and Xbox.
-# renpy/gdk.py initializes the runtime and signs in before init code runs.
-# Every function here is safe to call when GDK is unavailable.
+# Microsoft GDK services, the same on Windows (build.windows_gdk) and Xbox; safe when GDK is unavailable.
 
 init -1500 python in gdk:
     # Do not participate in saves.
@@ -72,9 +70,8 @@ init -1500 python in gdk:
 
     def sign_in(allow_ui=True):
         """
-        Starts signing in the default user, if no one is, and returns the
-        sign-in state: "none", "pending", "signed_in" or "failed". On Xbox,
-        this is always silent.
+        Starts signing in the default user (silently on Xbox). Returns "none",
+        "pending", "signed_in" or "failed".
         """
 
         m = _module()
@@ -109,10 +106,7 @@ init -1500 python in gdk:
 
     def unlock_achievement(id, percent=100):
         """
-        Sets the progress of the Xbox achievement `id` (a string, like "1")
-        to `percent`. Returns True if the request was sent. Prefer
-        achievement.register and achievement.grant, which also remember
-        unlocks made while offline.
+        Sets Xbox achievement `id` to `percent`; True if sent. Prefer achievement.grant.
         """
 
         m = _module()
@@ -132,9 +126,7 @@ init -1500 python in gdk:
 
     def save_folder():
         """
-        Where the saves are synchronized from: the XGameSaveFiles folder (PC,
-        with config.gdk_saves) or the console's cloud save folder. None when
-        the saves are local.
+        The cloud save folder (PC with config.gdk_saves, or Xbox), or None.
         """
 
         if renpy.gdk.is_xbox():
@@ -183,10 +175,7 @@ init -1499 python in achievement:
 
     class GdkBackend(Backend):
         """
-        A backend that sends achievements to Xbox services through GDK. Each
-        achievement goes by its `xbox` id (given to achievement.register),
-        defaulting to its name. Unlocks made while offline or signed out are
-        sent when a user next signs in.
+        Sends achievements to Xbox services by their `xbox` id (default: name), including offline unlocks.
         """
 
         def __init__(self):
@@ -207,8 +196,7 @@ init -1499 python in achievement:
 
         def confirmed(self):
             """
-            The set of achievement names the service has confirmed for the
-            signed-in user, or None if no one is.
+            Names the service confirmed for the signed-in user, or None.
             """
 
             user = gdk.user_id()
@@ -244,8 +232,7 @@ init -1499 python in achievement:
 
         def sync(self):
             """
-            Sends the achievements granted or in progress locally that the
-            service hasn't confirmed for this user.
+            Sends local unlocks and progress the service hasn't confirmed.
             """
 
             confirmed = self.confirmed()
@@ -268,9 +255,7 @@ init -1499 python in achievement:
                 return
 
             if m.user_changed():
-                # The console resumes the title with the default user. (On
-                # PC, signing out ends the game, and a silent sign-in that
-                # fails would too.)
+                # Xbox resumes with the default user; on PC, signing out ends the game.
                 if m.platform == "xbox":
                     m.sign_in(allow_ui=False)
                 return

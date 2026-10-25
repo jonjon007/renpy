@@ -588,20 +588,14 @@ def stage_gameconfig(config, layout, target):
 PRECOMPILE_DIRS = ("renpy", "pygame_sdl2", os.path.join("lib", "python3.12"))
 
 
-# Where a Windows build.windows_gdk distribution (and the SDK) has the PC _gdk
-# module, relative to the Ren'Py base.
+# Where build.windows_gdk distributions and the SDK keep the PC _gdk module.
 PC_GDK_LIB = "lib/gdk-windows-x86_64"
 
 
 def pc_gameconfig(config, exe):
     """
-    Makes the MicrosoftGame.config of a Windows GDK build from the project's
-    console one at `config`: TargetDeviceFamily becomes PC, and the
-    executable `exe` (the game's .exe name).
-
-    Returns (data, images, warnings): the config's bytes, a list of
-    (relative path, source path) for the ShellVisuals images it references,
-    and a list of warnings about the images that don't exist.
+    Makes a PC MicrosoftGame.config from the console one, for executable `exe`.
+    Returns (data, [(relative path, source path)] of images, warnings).
     """
 
     if not os.path.isfile(config):

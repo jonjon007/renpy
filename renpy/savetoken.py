@@ -42,16 +42,13 @@ verifying_keys = []  # type: list[bytes]
 # True if the save files and persistent data should be upgraded.
 should_upgrade = False  # type: bool
 
-# The fixed keys and zero signature written by the console runtime's former
-# renpy.ecsign stub, before it shipped a real renpy.ecsign.
+# The fixed keys and zero signature of the console's former renpy.ecsign stub.
 STUB_SIGNING_KEY = b"\x01" * 32
 STUB_VERIFYING_KEY = b"\x02" * 64
 STUB_SIGNATURE = b"\x00" * 64
 
-# True if the tokens were used by that stub (they hold its signing key), so
-# that the saves and persistent data it signed still load without a prompt.
-# They're re-signed with a real key when next saved. Its verifying key alone
-# never sets this: anyone can forge its signature.
+# True if the stub made these tokens (its signing key, never just its forgeable
+# verifying key), so its saves load without a prompt until re-signed.
 trust_stub_signatures = False  # type: bool
 
 
@@ -179,8 +176,7 @@ def check_load(log, signatures):
     if not ask(renpy.store.gui.UNKNOWN_TOKEN):
         return False
 
-    # Anyone can forge the stub's signature, so its key is never trusted
-    # through the prompt.
+    # The stub's signature is forgeable, so its key is never trusted.
     new_keys = [
         i for i in get_keys_from_signatures(signatures) if i not in verifying_keys and i != STUB_VERIFYING_KEY
     ]

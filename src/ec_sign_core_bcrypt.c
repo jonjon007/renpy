@@ -22,15 +22,8 @@
 */
 
 /*
- * ec_sign_core.h implemented with Windows CNG (BCrypt), for the Xbox GDK,
- * where OpenSSL isn't available. Keys and signatures are interchangeable with
- * ec_sign_core.c (OpenSSL), so saves signed on one platform verify on the other:
- *
- *   - ECDSA on P-256 over a SHA-1 digest.
- *   - Private keys are SEC1 ECPrivateKey DER with the curve and public key
- *     (what OpenSSL's "DER" keypair encoder writes). PKCS#8 is also accepted.
- *   - Public keys are SubjectPublicKeyInfo DER with an uncompressed point.
- *   - Signatures are raw 64-byte r || s.
+ * ec_sign_core.h on BCrypt for Xbox, interchangeable with ec_sign_core.c (OpenSSL): P-256 ECDSA
+ * over SHA-1, SEC1 DER private keys (PKCS#8 accepted), SPKI public keys, raw r || s signatures.
  */
 
 #ifdef _WIN32
@@ -310,11 +303,7 @@ static int sha1(const char *data, size_t data_len, unsigned char *digest)
     return ret;
 }
 
-/*
- * ec_sign_core.c verifies by turning r and s into 32-byte DER integers (33 with
- * a 0x00 pad when the top bit is set). OpenSSL rejects the result as
- * non-minimal when a value starts with 0x00 followed by a byte below 0x80.
- */
+/* ec_sign_core.c's DER re-encoding of r and s fails OpenSSL's minimal-encoding check for 0x00 then < 0x80. */
 static int openssl_encodable(const unsigned char *number)
 {
     return !(number[0] == 0 && number[1] < 0x80);

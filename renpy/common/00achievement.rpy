@@ -173,6 +173,10 @@ init -1500 python in achievement:
         `steam`
             The name to use on steam. If not given, defaults to `name`.
 
+        `xbox`
+            The Xbox achievement id, used on Xbox and in Windows builds with
+            :var:`build.windows_gdk`. If not given, defaults to `name`.
+
         `stat_max`
             The integer value of the stat at which the achievement unlocks.
 

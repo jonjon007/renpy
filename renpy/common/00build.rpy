@@ -530,10 +530,7 @@ init -1500 python in build:
     # the building machine, or None to not include them.
     windows_gdk_dlls = None
 
-    # Should Windows distributions use Microsoft GDK services (gdk.*, the GDK
-    # achievement backend, and cloud saves with config.gdk_saves)? This adds
-    # the _gdk module, the GDK's PC runtime DLLs, and a PC MicrosoftGame.config
-    # made from the project's xbox/MicrosoftGame.config.
+    # Should Windows distributions include _gdk, the GDK runtime and a PC MicrosoftGame.config?
     windows_gdk = False
 
     # Should the gameonly update be available?

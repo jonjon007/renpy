@@ -20,15 +20,7 @@
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 """
-Microsoft GDK services (Xbox sign-in, achievements and, on PC, cloud saves)
-through the _gdk extension module, on Windows and Xbox.
-
-On Xbox, _gdk is a built-in module of the console runtime. On Windows, it's in
-lib/gdk-windows-x86_64, and is used when a MicrosoftGame.config is next to the
-executable (a build.windows_gdk distribution), or, when running from source,
-when RENPY_GDK=1 is set and the project has xbox/MicrosoftGame.config.
-
-The game-facing API is the gdk namespace (renpy/common/00gdk.rpy).
+GDK init and, on PC with config.gdk_saves, cloud saves. The game-facing API is renpy/common/00gdk.rpy.
 """
 
 from __future__ import division, absolute_import, with_statement, print_function, unicode_literals
@@ -44,13 +36,11 @@ import renpy
 # The directory, relative to the Ren'Py base, holding the PC module.
 PC_LIB = os.path.join("lib", "gdk-windows-x86_64")
 
-# The PC game configuration.
 CONFIG = "MicrosoftGame.config"
 
 # The _gdk module, once initialized.
 module = None
 
-# True once init() has run.
 initialized = False
 
 # Why GDK services are unavailable, or None.
@@ -68,7 +58,7 @@ import_ledger = None
 # True if the saves should be in the cloud, but aren't.
 save_notice = False
 
-# Keep the DLL directories added.
+# os.add_dll_directory handles; the directories stay added while they're alive.
 _dll_directories = [ ]
 
 
@@ -95,9 +85,7 @@ def is_xbox():
 
 def find_config():
     """
-    Returns (found, path): whether to use GDK on Windows, and the
-    MicrosoftGame.config to pass to the runtime (None to let it find the one
-    next to the executable).
+    Returns (use GDK, MicrosoftGame.config path or None for the one next to the exe).
     """
 
     setting = os.environ.get("RENPY_GDK", "")
@@ -115,8 +103,7 @@ def find_config():
     if os.path.isfile(os.path.join(base, CONFIG)):
         return True, os.path.join(base, CONFIG)
 
-    # Running from source. The runtime ends the process when a silent
-    # sign-in fails, so this is opt in.
+    # From source, opt in: a failed silent sign-in ends the process.
     dev = os.path.join(base, "xbox", CONFIG)
 
     if setting and os.path.isfile(dev):
@@ -169,8 +156,7 @@ def import_module():
 
 def init():
     """
-    Initializes the GDK runtime and signs in the default user, if this is
-    a GDK build. Called once, before the save directory is chosen.
+    Initializes GDK and signs in, before the save directory is chosen.
     """
 
     global initialized, module, error
@@ -205,9 +191,7 @@ def init():
 
         import atexit
         atexit.register(shutdown)
-        # On PC, this may show the sign-in UI. A silent sign-in that fails
-        # makes the runtime end the game. On Xbox, the launcher has already
-        # signed in the default user.
+        # PC may show sign-in UI (a failed silent sign-in ends the game); Xbox is already signed in.
         state = m.sign_in(allow_ui=True, wait=True)
 
         log("Initialized: platform {}, title {}, user {}.".format(
@@ -280,12 +264,8 @@ def merge_tokens(src, dst):
 
 def import_saves(local_saves, local_tokens, root, user):
     """
-    Copies the saves in `local_saves` that are new or changed since the last
-    import into the cloud folder `root`, for `user`. The originals are kept.
-
-    A slot that differs from the cloud one is imported as an offline-* slot,
-    and a persistent that does is merged into the cloud one after it loads
-    (see merge_local_persistent). Returns the names of the imported files.
+    Copies new or changed local saves into the cloud folder `root` (originals kept; conflicts
+    become offline-* slots, persistent is merged later). Returns the imported file names.
     """
 
     global local_persistent, import_ledger
@@ -367,9 +347,7 @@ def write_ledger():
 
 def prepare_saves(gamedir):
     """
-    On PC, when config.gdk_saves is true and a user is signed in, puts the
-    saves and save tokens in the user's XGameSaveFiles folder, importing the
-    ones in the usual location. Called before the save directory is chosen.
+    With config.gdk_saves on PC, moves saves and tokens to the user's XGameSaveFiles folder.
     """
 
     global save_root, save_notice
@@ -411,8 +389,7 @@ def prepare_saves(gamedir):
 
 def path_to_saves(save_directory):
     """
-    Returns where the save directory (None) or tokens ("tokens") go when
-    they're in the cloud folder, or None to use the usual location.
+    The cloud path for the saves (None) or "tokens", or None for the usual location.
     """
 
     if save_root is None or save_directory not in (None, "tokens"):
@@ -423,8 +400,7 @@ def path_to_saves(save_directory):
 
 def merge_local_persistent():
     """
-    Merges a local persistent that differs from the cloud one into it.
-    Called once persistent data has loaded.
+    Merges a differing local persistent into the loaded cloud one.
     """
 
     global local_persistent

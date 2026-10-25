@@ -481,6 +481,15 @@ The following variables provide further control of the build process:
     Gives a version of the build used by the build process. If None, this defaults to config.version. The main use
     of this is to allow config.version to have characters that are not valid in file or directory names.
 
+.. var:: build.windows_gdk = False
+
+    If true, Windows distributions use Microsoft GDK services, the same as
+    Xbox: the ``gdk`` namespace, Xbox achievements (the `xbox` argument of
+    :func:`achievement.register`) and, with :var:`config.gdk_saves`, cloud
+    saves. The build adds Ren'Py's ``_gdk`` module, the GDK's PC runtime DLLs
+    (from the GDK installed on the computer doing the build) and a PC
+    MicrosoftGame.config made from the project's xbox/MicrosoftGame.config.
+
 .. var:: build.windows_gdk_dlls = None
 
     If not None, a directory in the Windows distributions (for example,
